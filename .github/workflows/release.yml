@@ -1,0 +1,30 @@
+name: Release agent
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Build static Linux agents
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/serverdeck-agent-linux-amd64 ./cmd/serverdeck-agent
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o dist/serverdeck-agent-linux-arm64 ./cmd/serverdeck-agent
+          cd dist
+          sha256sum serverdeck-agent-linux-amd64 serverdeck-agent-linux-arm64 > SHA256SUMS
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/serverdeck-agent-linux-amd64 dist/serverdeck-agent-linux-arm64 dist/SHA256SUMS --title "ServerDeck Agent ${GITHUB_REF_NAME#v}" --generate-notes
