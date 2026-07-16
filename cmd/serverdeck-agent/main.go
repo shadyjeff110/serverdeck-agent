@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	version         = "0.22.0"
+	version         = "0.22.1"
 	protocolVersion = 1
 )
 
@@ -1847,6 +1847,15 @@ func listManagedFilesEncoded(domain, path string) ([]managedFile, error) {
 		relative, _ := filepath.Rel(root, filepath.Join(target, entry.Name()))
 		values = append(values, managedFile{Name: entry.Name(), Path: filepath.ToSlash(relative), Directory: entry.IsDir(), Size: info.Size(), Modified: info.ModTime().UTC().Format(time.RFC3339)})
 	}
+	deduplicated := make([]packageSource, 0, len(values))
+	seen := map[string]bool{}
+	for _, value := range values {
+		key := fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%t", value.File, value.URI, value.Suite, value.SignedBy, value.Enabled)
+		if seen[key] { continue }
+		seen[key] = true
+		deduplicated = append(deduplicated, value)
+	}
+	values = deduplicated
 	sort.Slice(values, func(i, j int) bool {
 		if values[i].Directory != values[j].Directory {
 			return values[i].Directory
@@ -2387,7 +2396,7 @@ func listPackageSources() ([]packageSource, error) {
 
 func newPackageSource(path, uri, suite, signedBy string, enabled bool) packageSource {
 	hash := sha256.Sum256([]byte(path + "\x00" + uri + "\x00" + suite))
-	official := strings.Contains(uri, "archive.ubuntu.com") || strings.Contains(uri, "security.ubuntu.com") || strings.Contains(uri, "ports.ubuntu.com")
+	official := strings.Contains(uri, "archive.ubuntu.com") || strings.Contains(uri, "security.ubuntu.com") || strings.Contains(uri, "ports.ubuntu.com") || strings.Contains(uri, "archive.canonical.com")
 	return packageSource{
 		ID:       fmt.Sprintf("%x", hash[:8]),
 		File:     path,
