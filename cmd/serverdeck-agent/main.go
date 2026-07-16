@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	version         = "0.21.0"
+	version         = "0.22.0"
 	protocolVersion = 1
 )
 
@@ -51,6 +51,7 @@ type site struct {
 	NodeVersion string `json:"node_version,omitempty"`
 	Service     string `json:"service,omitempty"`
 	Port        int    `json:"port,omitempty"`
+	WebServer   string `json:"web_server,omitempty"`
 }
 
 type phpRuntime struct {
@@ -74,6 +75,43 @@ type softwarePackage struct {
 	Candidate   string `json:"candidate,omitempty"`
 	Active      bool   `json:"active"`
 	Description string `json:"description"`
+}
+
+type packageSource struct {
+	ID        string `json:"id"`
+	File      string `json:"file"`
+	URI       string `json:"uri"`
+	Suite     string `json:"suite,omitempty"`
+	Official  bool   `json:"official"`
+	SignedBy  string `json:"signed_by,omitempty"`
+	Enabled   bool   `json:"enabled"`
+}
+
+type sourceCatalogItem struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Supported   bool   `json:"supported"`
+	Enabled     bool   `json:"enabled"`
+	Reason      string `json:"reason,omitempty"`
+}
+
+type softwareRemovalPlan struct {
+	ID       string   `json:"id"`
+	Name     string   `json:"name"`
+	Allowed  bool     `json:"allowed"`
+	Reason   string   `json:"reason"`
+	Affected []string `json:"affected"`
+}
+
+type webMigrationPlan struct {
+	Source       string   `json:"source"`
+	Target       string   `json:"target"`
+	Sites        []string `json:"sites"`
+	TLS          []string `json:"tls"`
+	SafetyBackup bool     `json:"safety_backup"`
+	Allowed      bool     `json:"allowed"`
+	Reason       string   `json:"reason"`
 }
 
 type phpVersionStatus struct {
@@ -164,6 +202,7 @@ type database struct {
 	Host      string `json:"host"`
 	CreatedAt string `json:"created_at"`
 	Password  string `json:"password,omitempty"`
+	Engine    string `json:"engine,omitempty"`
 }
 
 type tlsStatus struct {
@@ -259,6 +298,8 @@ var managedServices = map[string]string{
 	"postfix":    "Mail transport",
 	"dovecot":    "Mail delivery",
 	"docker":     "Container runtime",
+	"redis-server": "Cache and data store",
+	"vsftpd":     "Legacy FTP server",
 	"fail2ban":   "Intrusion prevention",
 	"ufw":        "Firewall",
 }
@@ -308,7 +349,20 @@ func main() {
 			},
 		}
 	case "stack-install":
-		data, err = installWebStack()
+		if len(os.Args) != 11 {
+			err = errors.New("stack-install requires hosting, security, and SSH port choices")
+			break
+		}
+		var php, node, redis, ftp, fail2ban, firewall bool
+		var sshPort int
+		php, err = strconv.ParseBool(os.Args[4])
+		if err == nil { node, err = strconv.ParseBool(os.Args[5]) }
+		if err == nil { redis, err = strconv.ParseBool(os.Args[6]) }
+		if err == nil { ftp, err = strconv.ParseBool(os.Args[7]) }
+		if err == nil { fail2ban, err = strconv.ParseBool(os.Args[8]) }
+		if err == nil { firewall, err = strconv.ParseBool(os.Args[9]) }
+		if err == nil { sshPort, err = strconv.Atoi(os.Args[10]) }
+		if err == nil { data, err = installWebStack(os.Args[2], os.Args[3], php, node, redis, ftp, fail2ban, firewall, sshPort) }
 	case "site-list":
 		data, err = listSites()
 	case "site-create":
@@ -325,6 +379,66 @@ func main() {
 		data, err = listRuntimes()
 	case "software-list":
 		data, err = listSoftware()
+	case "source-list":
+		data, err = listPackageSources()
+	case "source-catalog":
+		data, err = packageSourceCatalog()
+	case "source-enable":
+		if len(os.Args) != 3 {
+			err = errors.New("source-enable requires an encoded catalog ID")
+			break
+		}
+		sourceID, decodeErr := decodeArgument(os.Args[2])
+		if decodeErr != nil {
+			err = decodeErr
+			break
+		}
+		data, err = enablePackageSource(sourceID)
+	case "software-install":
+		if len(os.Args) != 3 {
+			err = errors.New("software-install requires an encoded catalog ID")
+			break
+		}
+		softwareID, decodeErr := decodeArgument(os.Args[2])
+		if decodeErr != nil {
+			err = decodeErr
+			break
+		}
+		data, err = installCatalogSoftware(softwareID)
+	case "software-remove-plan":
+		if len(os.Args) != 3 {
+			err = errors.New("software-remove-plan requires an encoded catalog ID")
+			break
+		}
+		softwareID, decodeErr := decodeArgument(os.Args[2])
+		if decodeErr != nil {
+			err = decodeErr
+			break
+		}
+		data, err = planSoftwareRemoval(softwareID)
+	case "software-remove":
+		if len(os.Args) != 3 {
+			err = errors.New("software-remove requires an encoded catalog ID")
+			break
+		}
+		softwareID, decodeErr := decodeArgument(os.Args[2])
+		if decodeErr != nil {
+			err = decodeErr
+			break
+		}
+		data, err = removeCatalogSoftware(softwareID)
+	case "web-migration-plan":
+		if len(os.Args) != 3 {
+			err = errors.New("web-migration-plan requires a target web server")
+			break
+		}
+		data, err = planWebMigration(os.Args[2])
+	case "web-migrate":
+		if len(os.Args) != 3 {
+			err = errors.New("web-migrate requires a target web server")
+			break
+		}
+		data, err = migrateWebServer(os.Args[2])
 	case "mail-status":
 		data, err = inspectMail()
 	case "mail-stack-install":
@@ -1073,27 +1187,39 @@ func restoreBackup(id string) (restoreResult, error) {
 		return result, fmt.Errorf("extract backup: %s", tail(string(output), 800))
 	}
 
-	configSafety, err := os.MkdirTemp("/var/lib/serverdeck", ".nginx-safety-*")
+	configSafety, err := os.MkdirTemp("/var/lib/serverdeck", ".web-config-safety-*")
 	if err != nil {
 		return result, err
 	}
 	defer os.RemoveAll(configSafety)
-	for _, directory := range []string{"sites-available", "sites-enabled"} {
-		_ = exec.Command("cp", "-a", filepath.Join("/etc/nginx", directory), configSafety).Run()
-	}
-	rollbackNginx := func() {
+	for _, serverName := range []string{"nginx", "apache2"} {
+		serverSafety := filepath.Join(configSafety, serverName)
+		_ = os.MkdirAll(serverSafety, 0755)
 		for _, directory := range []string{"sites-available", "sites-enabled"} {
-			_ = os.RemoveAll(filepath.Join("/etc/nginx", directory))
-			_ = exec.Command("cp", "-a", filepath.Join(configSafety, directory), "/etc/nginx/").Run()
+			_ = exec.Command("cp", "-a", filepath.Join("/etc", serverName, directory), serverSafety).Run()
 		}
-		_ = exec.Command("systemctl", "reload", "nginx").Run()
 	}
-	for _, directory := range []string{"sites-available", "sites-enabled"} {
-		source := filepath.Join(staging, "etc/nginx", directory)
-		if _, err := os.Stat(source); err == nil {
-			if output, err := exec.Command("cp", "-a", source+"/.", filepath.Join("/etc/nginx", directory)).CombinedOutput(); err != nil {
-				rollbackNginx()
-				return result, fmt.Errorf("restore Nginx: %s", tail(string(output), 800))
+	rollbackWebConfig := func() {
+		for _, serverName := range []string{"nginx", "apache2"} {
+			for _, directory := range []string{"sites-available", "sites-enabled"} {
+				saved := filepath.Join(configSafety, serverName, directory)
+				if _, err := os.Stat(saved); err == nil {
+					_ = os.RemoveAll(filepath.Join("/etc", serverName, directory))
+					_ = exec.Command("cp", "-a", saved, filepath.Join("/etc", serverName)+"/").Run()
+				}
+			}
+		}
+		if packageVersion("nginx") != "" { _ = exec.Command("systemctl", "reload", "nginx").Run() }
+		if packageVersion("apache2") != "" { _ = exec.Command("systemctl", "reload", "apache2").Run() }
+	}
+	for _, serverName := range []string{"nginx", "apache2"} {
+		for _, directory := range []string{"sites-available", "sites-enabled"} {
+			source := filepath.Join(staging, "etc", serverName, directory)
+			if _, err := os.Stat(source); err == nil {
+				if output, err := exec.Command("cp", "-a", source+"/.", filepath.Join("/etc", serverName, directory)).CombinedOutput(); err != nil {
+					rollbackWebConfig()
+					return result, fmt.Errorf("restore %s configuration: %s", serverName, tail(string(output), 800))
+				}
 			}
 		}
 	}
@@ -1103,19 +1229,31 @@ func restoreBackup(id string) (restoreResult, error) {
 			if _, err := os.Stat(pair[0]); err == nil {
 				_ = os.RemoveAll(pair[1])
 				if output, err := exec.Command("cp", "-a", pair[0], pair[1]).CombinedOutput(); err != nil {
-					rollbackNginx()
+					rollbackWebConfig()
 					return result, fmt.Errorf("restore site %s: %s", domain, tail(string(output), 800))
 				}
 			}
 		}
 	}
-	if output, err := exec.Command("nginx", "-t").CombinedOutput(); err != nil {
-		rollbackNginx()
-		return result, fmt.Errorf("restored Nginx validation failed: %s", tail(string(output), 800))
+	if packageVersion("nginx") != "" {
+		if output, err := exec.Command("nginx", "-t").CombinedOutput(); err != nil {
+			rollbackWebConfig()
+			return result, fmt.Errorf("restored Nginx validation failed: %s", tail(string(output), 800))
+		}
+		if err := exec.Command("systemctl", "reload", "nginx").Run(); err != nil {
+			rollbackWebConfig()
+			return result, err
+		}
 	}
-	if err := exec.Command("systemctl", "reload", "nginx").Run(); err != nil {
-		rollbackNginx()
-		return result, err
+	if packageVersion("apache2") != "" {
+		if output, err := exec.Command("apache2ctl", "configtest").CombinedOutput(); err != nil {
+			rollbackWebConfig()
+			return result, fmt.Errorf("restored Apache validation failed: %s", tail(string(output), 800))
+		}
+		if err := exec.Command("systemctl", "reload", "apache2").Run(); err != nil {
+			rollbackWebConfig()
+			return result, err
+		}
 	}
 	for _, name := range value.Databases {
 		dump := filepath.Join(staging, "var/backups/serverdeck", id, "databases", name+".sql")
@@ -1123,7 +1261,23 @@ func restoreBackup(id string) (restoreResult, error) {
 		if openErr != nil {
 			return result, openErr
 		}
+		engine := ""
+		metadataPath := filepath.Join(staging, "var/lib/serverdeck/databases", name+".json")
+		if _, statErr := os.Stat(metadataPath); statErr != nil {
+			metadataPath = filepath.Join("/var/lib/serverdeck/databases", name+".json")
+		}
+		if metadata, readErr := os.ReadFile(metadataPath); readErr == nil {
+			var managed database
+			if json.Unmarshal(metadata, &managed) == nil {
+				engine = managed.Engine
+			}
+		}
 		command := exec.Command("mariadb", name)
+		if engine == "MySQL" {
+			command = exec.Command("mysql", name)
+		} else if engine == "PostgreSQL" {
+			command = exec.Command("runuser", "-u", "postgres", "--", "psql", "--set", "ON_ERROR_STOP=1", "--dbname", name)
+		}
 		command.Stdin = file
 		output, importErr := command.CombinedOutput()
 		file.Close()
@@ -1195,7 +1349,13 @@ func createBackup() (backup, error) {
 	databaseNames := make([]string, 0, len(databases))
 	for _, database := range databases {
 		destination := filepath.Join(root, "databases", database.Name+".sql")
-		if output, err := exec.Command("mariadb-dump", "--single-transaction", "--routines", "--triggers", "--result-file="+destination, database.Name).CombinedOutput(); err != nil {
+		command := exec.Command("mariadb-dump", "--single-transaction", "--routines", "--triggers", "--result-file="+destination, database.Name)
+		if database.Engine == "MySQL" {
+			command = exec.Command("mysqldump", "--single-transaction", "--routines", "--triggers", "--result-file="+destination, database.Name)
+		} else if database.Engine == "PostgreSQL" {
+			command = exec.Command("runuser", "-u", "postgres", "--", "pg_dump", "--clean", "--if-exists", "--file", destination, database.Name)
+		}
+		if output, err := command.CombinedOutput(); err != nil {
 			_ = writeAudit("backup.create.failed", false, database.Name+": "+tail(string(output), 800))
 			return value, fmt.Errorf("database dump failed for %s: %s", database.Name, tail(string(output), 800))
 		}
@@ -1212,7 +1372,7 @@ func createBackup() (backup, error) {
 
 	archive := filepath.Join(root, "serverdeck-backup.tar.gz")
 	paths := []string{"-czf", archive}
-	for _, path := range []string{"/var/lib/serverdeck", "/etc/nginx/sites-available", "/etc/nginx/sites-enabled", "/var/www", filepath.Join(root, "databases")} {
+	for _, path := range []string{"/var/lib/serverdeck", "/etc/nginx/sites-available", "/etc/nginx/sites-enabled", "/etc/apache2/sites-available", "/etc/apache2/sites-enabled", "/var/www", filepath.Join(root, "databases")} {
 		if _, err := os.Stat(path); err == nil {
 			paths = append(paths, path)
 		}
@@ -1326,25 +1486,51 @@ func issueTLS(domain, email string) (tlsStatus, error) {
 		return tlsStatus{}, errors.New("invalid domain or email address")
 	}
 	metadataPath := filepath.Join("/var/lib/serverdeck/sites", domain+".json")
-	if _, err := os.Stat(metadataPath); err != nil {
+	metadata, err := os.ReadFile(metadataPath)
+	if err != nil {
 		return tlsStatus{}, errors.New("managed website was not found")
+	}
+	var managedSite site
+	if err := json.Unmarshal(metadata, &managedSite); err != nil {
+		return tlsStatus{}, err
 	}
 	readiness := inspectTLS(domain)
 	if !readiness.Ready {
 		return readiness, errors.New(readiness.Message)
 	}
+	webServer := managedSite.WebServer
+	if webServer == "" {
+		webServer = "nginx"
+	}
 	configPath := filepath.Join("/etc/nginx/sites-available", domain)
+	if webServer == "apache" {
+		configPath = filepath.Join("/etc/apache2/sites-available", domain+".conf")
+	}
 	original, err := os.ReadFile(configPath)
 	if err != nil {
 		return readiness, err
 	}
 	_ = writeAudit("tls.issue.started", true, domain)
 	arguments := []string{"certonly", "--nginx", "--non-interactive", "--agree-tos", "--keep-until-expiring", "--email", email, "--domain", domain}
+	if webServer == "apache" {
+		arguments = []string{"--apache", "--non-interactive", "--agree-tos", "--keep-until-expiring", "--redirect", "--email", email, "--domain", domain}
+	}
 	if output, err := exec.Command("certbot", arguments...).CombinedOutput(); err != nil {
 		_ = atomicWrite(configPath, original, 0644)
-		_ = exec.Command("systemctl", "reload", "nginx").Run()
+		_ = exec.Command("systemctl", "reload", map[string]string{"nginx": "nginx", "apache": "apache2"}[webServer]).Run()
 		_ = writeAudit("tls.issue.failed", false, domain+": "+tail(string(output), 800))
 		return readiness, fmt.Errorf("Certbot failed: %s", tail(string(output), 800))
+	}
+	if webServer == "apache" {
+		if output, err := exec.Command("apache2ctl", "configtest").CombinedOutput(); err != nil {
+			_ = writeAudit("tls.issue.failed", false, domain+": "+tail(string(output), 800))
+			return readiness, fmt.Errorf("Apache TLS validation failed: %s", tail(string(output), 800))
+		}
+		if err := exec.Command("systemctl", "reload", "apache2").Run(); err != nil {
+			return readiness, err
+		}
+		_ = writeAudit("tls.issue.completed", true, domain)
+		return inspectTLS(domain), nil
 	}
 	certificatePath := filepath.Join("/etc/letsencrypt/live", domain)
 	tlsBlock := fmt.Sprintf("\n    listen 443 ssl;\n    listen [::]:443 ssl;\n    ssl_certificate %s/fullchain.pem;\n    ssl_certificate_key %s/privkey.pem;\n", certificatePath, certificatePath)
@@ -1407,18 +1593,49 @@ func createDatabase(name, username string) (database, error) {
 	if err != nil {
 		return value, err
 	}
-	sql := fmt.Sprintf("CREATE DATABASE `%s` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; CREATE USER '%s'@'localhost' IDENTIFIED BY '%s'; GRANT ALL PRIVILEGES ON `%s`.* TO '%s'@'localhost'; FLUSH PRIVILEGES;", name, username, password, name, username)
-	if output, err := exec.Command("mariadb", "--batch", "--skip-column-names", "--execute", sql).CombinedOutput(); err != nil {
-		_ = writeAudit("database.create.failed", false, name+": "+tail(string(output), 500))
-		return value, fmt.Errorf("MariaDB rejected database creation: %s", tail(string(output), 500))
+	databaseClient := ""
+	engine := ""
+	if packageVersion("mariadb-server") != "" {
+		databaseClient = "mariadb"
+		engine = "MariaDB"
+	} else if packageVersion("mysql-server") != "" {
+		databaseClient = "mysql"
+		engine = "MySQL"
+	} else if packageVersion("postgresql") != "" {
+		engine = "PostgreSQL"
+	} else {
+		return value, errors.New("MariaDB, MySQL, or PostgreSQL must be installed before creating a managed database")
 	}
-	value = database{Name: name, Username: username, Host: "localhost", CreatedAt: time.Now().UTC().Format(time.RFC3339), Password: password}
+	if engine == "PostgreSQL" {
+		roleSQL := fmt.Sprintf("CREATE ROLE %s LOGIN PASSWORD '%s'", username, password)
+		if output, err := exec.Command("runuser", "-u", "postgres", "--", "psql", "--set", "ON_ERROR_STOP=1", "--command", roleSQL).CombinedOutput(); err != nil {
+			_ = writeAudit("database.create.failed", false, name+": "+tail(string(output), 500))
+			return value, fmt.Errorf("PostgreSQL rejected role creation: %s", tail(string(output), 500))
+		}
+		if output, err := exec.Command("runuser", "-u", "postgres", "--", "createdb", "--owner", username, name).CombinedOutput(); err != nil {
+			_ = exec.Command("runuser", "-u", "postgres", "--", "dropuser", "--if-exists", username).Run()
+			_ = writeAudit("database.create.failed", false, name+": "+tail(string(output), 500))
+			return value, fmt.Errorf("PostgreSQL rejected database creation: %s", tail(string(output), 500))
+		}
+	} else {
+		sql := fmt.Sprintf("CREATE DATABASE `%s` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; CREATE USER '%s'@'localhost' IDENTIFIED BY '%s'; GRANT ALL PRIVILEGES ON `%s`.* TO '%s'@'localhost'; FLUSH PRIVILEGES;", name, username, password, name, username)
+		if output, err := exec.Command(databaseClient, "--batch", "--skip-column-names", "--execute", sql).CombinedOutput(); err != nil {
+			_ = writeAudit("database.create.failed", false, name+": "+tail(string(output), 500))
+			return value, fmt.Errorf("%s rejected database creation: %s", engine, tail(string(output), 500))
+		}
+	}
+	value = database{Name: name, Username: username, Host: "localhost", CreatedAt: time.Now().UTC().Format(time.RFC3339), Password: password, Engine: engine}
 	metadataValue := value
 	metadataValue.Password = ""
 	encoded, _ := json.MarshalIndent(metadataValue, "", "  ")
 	if err := atomicWrite(metadataPath, append(encoded, '\n'), 0644); err != nil {
-		cleanup := fmt.Sprintf("DROP DATABASE IF EXISTS `%s`; DROP USER IF EXISTS '%s'@'localhost';", name, username)
-		_ = exec.Command("mariadb", "--execute", cleanup).Run()
+		if engine == "PostgreSQL" {
+			_ = exec.Command("runuser", "-u", "postgres", "--", "dropdb", "--if-exists", name).Run()
+			_ = exec.Command("runuser", "-u", "postgres", "--", "dropuser", "--if-exists", username).Run()
+		} else {
+			cleanup := fmt.Sprintf("DROP DATABASE IF EXISTS `%s`; DROP USER IF EXISTS '%s'@'localhost';", name, username)
+			_ = exec.Command(databaseClient, "--execute", cleanup).Run()
+		}
 		return database{}, err
 	}
 	_ = writeAudit("database.create.completed", true, name+" user "+username)
@@ -2068,14 +2285,22 @@ func unitActive(name string) bool {
 }
 
 func listSoftware() ([]softwarePackage, error) {
+	dockerPackage := "docker.io"
+	dockerDescription := "Ubuntu-maintained container runtime"
+	if packageCandidate("docker-ce") != "" {
+		dockerPackage = "docker-ce"
+		dockerDescription = "Docker Engine from Docker's official repository"
+	}
 	catalog := []softwarePackage{
 		{ID: "nginx", Name: "Nginx", Category: "Web", Package: "nginx", Description: "Web server and reverse proxy"},
 		{ID: "apache2", Name: "Apache", Category: "Web", Package: "apache2", Description: "Alternative web server"},
 		{ID: "mariadb", Name: "MariaDB", Category: "Database", Package: "mariadb-server", Description: "Relational database server"},
+		{ID: "mysql", Name: "MySQL", Category: "Database", Package: "mysql-server", Description: "MySQL database server"},
 		{ID: "postgresql", Name: "PostgreSQL", Category: "Database", Package: "postgresql", Description: "Relational database server"},
 		{ID: "redis", Name: "Redis", Category: "Database", Package: "redis-server", Description: "In-memory cache and data store"},
 		{ID: "nodejs", Name: "Node.js", Category: "Runtime", Package: "nodejs", Description: "JavaScript runtime"},
-		{ID: "docker", Name: "Docker", Category: "Containers", Package: "docker.io", Description: "Container runtime"},
+		{ID: "vsftpd", Name: "vsftpd", Category: "File Transfer", Package: "vsftpd", Description: "Optional legacy FTP server; SFTP is preferred"},
+		{ID: "docker", Name: "Docker", Category: "Containers", Package: dockerPackage, Description: dockerDescription},
 		{ID: "postfix", Name: "Postfix", Category: "Email", Package: "postfix", Description: "Mail transfer agent"},
 		{ID: "dovecot", Name: "Dovecot", Category: "Email", Package: "dovecot-core", Description: "IMAP and POP3 server"},
 		{ID: "fail2ban", Name: "Fail2ban", Category: "Security", Package: "fail2ban", Description: "Intrusion prevention"},
@@ -2083,7 +2308,7 @@ func listSoftware() ([]softwarePackage, error) {
 		{ID: "certbot", Name: "Certbot", Category: "Utilities", Package: "certbot", Description: "Let's Encrypt certificate client"},
 		{ID: "git", Name: "Git", Category: "Utilities", Package: "git", Description: "Source control client"},
 	}
-	units := map[string]string{"nginx": "nginx", "apache2": "apache2", "mariadb": "mariadb", "postgresql": "postgresql", "redis": "redis-server", "docker": "docker", "postfix": "postfix", "dovecot": "dovecot", "fail2ban": "fail2ban", "ufw": "ufw"}
+	units := map[string]string{"nginx": "nginx", "apache2": "apache2", "mariadb": "mariadb", "mysql": "mysql", "postgresql": "postgresql", "redis": "redis-server", "vsftpd": "vsftpd", "docker": "docker", "postfix": "postfix", "dovecot": "dovecot", "fail2ban": "fail2ban", "ufw": "ufw"}
 	for index := range catalog {
 		catalog[index].Version = packageVersion(catalog[index].Package)
 		catalog[index].Installed = catalog[index].Version != ""
@@ -2093,6 +2318,393 @@ func listSoftware() ([]softwarePackage, error) {
 		}
 	}
 	return catalog, nil
+}
+
+func listPackageSources() ([]packageSource, error) {
+	paths := []string{"/etc/apt/sources.list"}
+	additional, _ := filepath.Glob("/etc/apt/sources.list.d/*")
+	paths = append(paths, additional...)
+	values := []packageSource{}
+	for _, path := range paths {
+		info, statErr := os.Stat(path)
+		if statErr != nil || info.IsDir() || (!strings.HasSuffix(path, ".list") && !strings.HasSuffix(path, ".sources") && path != "/etc/apt/sources.list") {
+			continue
+		}
+		contents, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return nil, readErr
+		}
+		if strings.HasSuffix(path, ".sources") {
+			stanzas := regexp.MustCompile(`\n\s*\n`).Split(string(contents), -1)
+			for _, stanza := range stanzas {
+				fields := map[string]string{}
+				for _, line := range strings.Split(stanza, "\n") {
+					parts := strings.SplitN(line, ":", 2)
+					if len(parts) == 2 {
+						fields[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+					}
+				}
+				enabled := strings.ToLower(fields["Enabled"]) != "no"
+				for _, uri := range strings.Fields(fields["URIs"]) {
+					values = append(values, newPackageSource(path, uri, fields["Suites"], fields["Signed-By"], enabled))
+				}
+			}
+			continue
+		}
+		for _, rawLine := range strings.Split(string(contents), "\n") {
+			line := strings.TrimSpace(rawLine)
+			enabled := true
+			if strings.HasPrefix(line, "#") {
+				enabled = false
+				line = strings.TrimSpace(strings.TrimPrefix(line, "#"))
+			}
+			if !strings.HasPrefix(line, "deb ") {
+				continue
+			}
+			signedBy := ""
+			if match := regexp.MustCompile(`signed-by=([^\] ]+)`).FindStringSubmatch(line); len(match) == 2 {
+				signedBy = match[1]
+			}
+			line = regexp.MustCompile(`^deb\s+(\[[^\]]+\]\s+)?`).ReplaceAllString(line, "")
+			parts := strings.Fields(line)
+			if len(parts) >= 1 {
+				suite := ""
+				if len(parts) >= 2 {
+					suite = parts[1]
+				}
+				values = append(values, newPackageSource(path, parts[0], suite, signedBy, enabled))
+			}
+		}
+	}
+	sort.Slice(values, func(i, j int) bool {
+		if values[i].Official != values[j].Official {
+			return values[i].Official
+		}
+		return values[i].URI < values[j].URI
+	})
+	return values, nil
+}
+
+func newPackageSource(path, uri, suite, signedBy string, enabled bool) packageSource {
+	hash := sha256.Sum256([]byte(path + "\x00" + uri + "\x00" + suite))
+	official := strings.Contains(uri, "archive.ubuntu.com") || strings.Contains(uri, "security.ubuntu.com") || strings.Contains(uri, "ports.ubuntu.com")
+	return packageSource{
+		ID:       fmt.Sprintf("%x", hash[:8]),
+		File:     path,
+		URI:      uri,
+		Suite:    suite,
+		Official: official,
+		SignedBy: signedBy,
+		Enabled:  enabled,
+	}
+}
+
+func ubuntuCodename() string {
+	contents, _ := os.ReadFile("/etc/os-release")
+	for _, line := range strings.Split(string(contents), "\n") {
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) == 2 && (parts[0] == "UBUNTU_CODENAME" || parts[0] == "VERSION_CODENAME") {
+			return strings.Trim(parts[1], "\"")
+		}
+	}
+	return ""
+}
+
+func packageSourceCatalog() ([]sourceCatalogItem, error) {
+	codename := ubuntuCodename()
+	sources, err := listPackageSources()
+	if err != nil {
+		return nil, err
+	}
+	hasURI := func(fragment string) bool {
+		for _, source := range sources {
+			if source.Enabled && strings.Contains(source.URI, fragment) {
+				return true
+			}
+		}
+		return false
+	}
+	phpSupported := codename == "jammy" || codename == "noble"
+	dockerSupported := codename == "jammy" || codename == "noble" || codename == "questing" || codename == "resolute"
+	phpReason := ""
+	if !phpSupported {
+		phpReason = "Available only for currently supported Ubuntu LTS releases (22.04 and 24.04)"
+	}
+	dockerReason := ""
+	if !dockerSupported {
+		dockerReason = "Docker does not list this Ubuntu release as supported"
+	}
+	return []sourceCatalogItem{
+		{ID: "ondrej-php", Name: "PHP versions by Ondřej Surý", Description: "Co-installable PHP versions for current Ubuntu LTS releases", Supported: phpSupported, Enabled: hasURI("ppa.launchpadcontent.net/ondrej/php"), Reason: phpReason},
+		{ID: "docker", Name: "Docker official", Description: "Docker Engine, Compose, Buildx, and containerd packages", Supported: dockerSupported, Enabled: hasURI("download.docker.com/linux/ubuntu"), Reason: dockerReason},
+		{ID: "nodesource", Name: "NodeSource", Description: "Additional Node.js release lines", Supported: false, Enabled: hasURI("deb.nodesource.com"), Reason: "Temporarily unavailable while upstream signing and repository reliability issues are reviewed"},
+	}, nil
+}
+
+func enablePackageSource(id string) ([]sourceCatalogItem, error) {
+	if os.Geteuid() != 0 {
+		return nil, errors.New("source-enable must run as root")
+	}
+	codename := ubuntuCodename()
+	if output, err := exec.Command("apt-get", "update").CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("refresh package information: %s", tail(string(output), 800))
+	}
+	if output, err := exec.Command("apt-get", "install", "-y", "--no-install-recommends", "ca-certificates", "gnupg").CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("install repository prerequisites: %s", tail(string(output), 800))
+	}
+	if err := os.MkdirAll("/etc/apt/keyrings", 0755); err != nil {
+		return nil, err
+	}
+	created := []string{}
+	rollback := func() {
+		for _, path := range created {
+			_ = os.Remove(path)
+		}
+	}
+	switch id {
+	case "ondrej-php":
+		if codename != "jammy" && codename != "noble" {
+			return nil, errors.New("the PHP PPA supports Ubuntu 22.04 and 24.04 only")
+		}
+		keyData, err := downloadRepositoryFile("https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xB8DC7E53946656EFBCE4C1DD71DAEAAB4AD4CAB6")
+		if err != nil {
+			return nil, err
+		}
+		temporary, err := os.CreateTemp("", "serverdeck-php-key-*")
+		if err != nil {
+			return nil, err
+		}
+		temporaryPath := temporary.Name()
+		defer os.Remove(temporaryPath)
+		if _, err = temporary.Write(keyData); err != nil {
+			temporary.Close()
+			return nil, err
+		}
+		temporary.Close()
+		fingerprints, err := exec.Command("gpg", "--batch", "--show-keys", "--with-colons", temporaryPath).Output()
+		if err != nil || !strings.Contains(string(fingerprints), "B8DC7E53946656EFBCE4C1DD71DAEAAB4AD4CAB6") {
+			return nil, errors.New("PHP repository signing key fingerprint did not match the verified fingerprint")
+		}
+		keyPath := "/etc/apt/keyrings/serverdeck-ondrej-php.gpg"
+		if output, err := exec.Command("gpg", "--batch", "--yes", "--dearmor", "--output", keyPath, temporaryPath).CombinedOutput(); err != nil {
+			return nil, fmt.Errorf("store PHP repository key: %s", tail(string(output), 800))
+		}
+		created = append(created, keyPath)
+		sourcePath := "/etc/apt/sources.list.d/serverdeck-ondrej-php.sources"
+		source := fmt.Sprintf("Types: deb\nURIs: https://ppa.launchpadcontent.net/ondrej/php/ubuntu\nSuites: %s\nComponents: main\nSigned-By: %s\n", codename, keyPath)
+		if err := atomicWrite(sourcePath, []byte(source), 0644); err != nil {
+			rollback()
+			return nil, err
+		}
+		created = append(created, sourcePath)
+	case "docker":
+		allowed := codename == "jammy" || codename == "noble" || codename == "questing" || codename == "resolute"
+		if !allowed {
+			return nil, errors.New("Docker does not list this Ubuntu release as supported")
+		}
+		keyData, err := downloadRepositoryFile("https://download.docker.com/linux/ubuntu/gpg")
+		if err != nil {
+			return nil, err
+		}
+		keyPath := "/etc/apt/keyrings/docker.asc"
+		if err := atomicWrite(keyPath, keyData, 0644); err != nil {
+			return nil, err
+		}
+		created = append(created, keyPath)
+		architectureData, architectureErr := exec.Command("dpkg", "--print-architecture").Output()
+		if architectureErr != nil {
+			rollback()
+			return nil, errors.New("could not determine package architecture")
+		}
+		architecture := strings.TrimSpace(string(architectureData))
+		sourcePath := "/etc/apt/sources.list.d/docker.sources"
+		source := fmt.Sprintf("Types: deb\nURIs: https://download.docker.com/linux/ubuntu\nSuites: %s\nComponents: stable\nArchitectures: %s\nSigned-By: %s\n", codename, architecture, keyPath)
+		if err := atomicWrite(sourcePath, []byte(source), 0644); err != nil {
+			rollback()
+			return nil, err
+		}
+		created = append(created, sourcePath)
+	default:
+		return nil, errors.New("source is not available in the verified ServerDeck catalog")
+	}
+	if output, err := exec.Command("apt-get", "update").CombinedOutput(); err != nil {
+		rollback()
+		return nil, fmt.Errorf("verify repository: %s", tail(string(output), 1000))
+	}
+	_ = writeAudit("source.enable.completed", true, id)
+	return packageSourceCatalog()
+}
+
+func downloadRepositoryFile(address string) ([]byte, error) {
+	client := &http.Client{Timeout: 30 * time.Second}
+	response, err := client.Get(address)
+	if err != nil {
+		return nil, fmt.Errorf("download repository key: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return nil, fmt.Errorf("download repository key: HTTP %d", response.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(response.Body, 2*1024*1024))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) == 0 {
+		return nil, errors.New("repository key download was empty")
+	}
+	return data, nil
+}
+
+func installCatalogSoftware(id string) ([]softwarePackage, error) {
+	if os.Geteuid() != 0 {
+		return nil, errors.New("software-install must run as root")
+	}
+	catalog := map[string]struct {
+		packages []string
+		unit     string
+	}{
+		"nginx":      {[]string{"nginx"}, "nginx"},
+		"apache2":    {[]string{"apache2"}, "apache2"},
+		"mariadb":    {[]string{"mariadb-server"}, "mariadb"},
+		"mysql":      {[]string{"mysql-server"}, "mysql"},
+		"postgresql": {[]string{"postgresql"}, "postgresql"},
+		"redis":      {[]string{"redis-server"}, "redis-server"},
+		"nodejs":     {[]string{"nodejs", "npm"}, ""},
+		"vsftpd":     {[]string{"vsftpd"}, "vsftpd"},
+		"docker":     {[]string{"docker.io"}, "docker"},
+		"postfix":    {[]string{"postfix"}, "postfix"},
+		"dovecot":    {[]string{"dovecot-core", "dovecot-imapd"}, "dovecot"},
+		"fail2ban":   {[]string{"fail2ban"}, "fail2ban"},
+		"ufw":        {[]string{"ufw"}, ""},
+		"certbot":    {[]string{"certbot"}, ""},
+		"git":        {[]string{"git"}, ""},
+	}
+	if packageCandidate("docker-ce") != "" {
+		catalog["docker"] = struct {
+			packages []string
+			unit     string
+		}{[]string{"docker-ce", "docker-ce-cli", "containerd.io", "docker-buildx-plugin", "docker-compose-plugin"}, "docker"}
+	}
+	selection, ok := catalog[id]
+	if !ok {
+		return nil, errors.New("software is not in the verified ServerDeck catalog")
+	}
+	if id == "postfix" || id == "dovecot" {
+		return nil, errors.New("mail components must be installed together through ServerDeck Email setup")
+	}
+	if id == "nginx" && packageVersion("apache2") != "" {
+		return nil, errors.New("Apache is already installed; migrate or remove it before installing Nginx")
+	}
+	if id == "apache2" && packageVersion("nginx") != "" {
+		return nil, errors.New("Nginx is already installed; migrate or remove it before installing Apache")
+	}
+	if id == "mariadb" && packageVersion("mysql-server") != "" {
+		return nil, errors.New("MySQL is already installed; MariaDB cannot be installed beside it safely")
+	}
+	if id == "mysql" && packageVersion("mariadb-server") != "" {
+		return nil, errors.New("MariaDB is already installed; MySQL cannot be installed beside it safely")
+	}
+	if id == "postgresql" && (packageVersion("mariadb-server") != "" || packageVersion("mysql-server") != "") {
+		return nil, errors.New("A MySQL-compatible database is already installed; ServerDeck manages one database engine per server")
+	}
+	if (id == "mariadb" || id == "mysql") && packageVersion("postgresql") != "" {
+		return nil, errors.New("PostgreSQL is already installed; ServerDeck manages one database engine per server")
+	}
+	if id == "docker" && packageCandidate("docker-ce") != "" && packageVersion("docker.io") != "" {
+		return nil, errors.New("Ubuntu docker.io is already installed; migrate it before installing Docker Engine from the official source")
+	}
+	if err := writeAudit("software.install.started", true, id); err != nil {
+		return nil, err
+	}
+	if output, err := exec.Command("apt-get", "update").CombinedOutput(); err != nil {
+		_ = writeAudit("software.install.failed", false, id+": "+tail(string(output), 800))
+		return nil, fmt.Errorf("refresh package information: %s", tail(string(output), 800))
+	}
+	arguments := append([]string{"install", "-y", "--no-install-recommends"}, selection.packages...)
+	if output, err := exec.Command("apt-get", arguments...).CombinedOutput(); err != nil {
+		_ = writeAudit("software.install.failed", false, id+": "+tail(string(output), 800))
+		return nil, fmt.Errorf("install %s: %s", id, tail(string(output), 800))
+	}
+	if selection.unit != "" {
+		if output, err := exec.Command("systemctl", "enable", "--now", selection.unit).CombinedOutput(); err != nil {
+			_ = writeAudit("software.install.failed", false, id+": "+tail(string(output), 800))
+			return nil, fmt.Errorf("enable %s: %s", selection.unit, tail(string(output), 800))
+		}
+	}
+	_ = writeAudit("software.install.completed", true, id)
+	return listSoftware()
+}
+
+func planSoftwareRemoval(id string) (softwareRemovalPlan, error) {
+	names := map[string]string{"nginx": "Nginx", "apache2": "Apache", "mariadb": "MariaDB", "mysql": "MySQL", "postgresql": "PostgreSQL", "redis": "Redis", "nodejs": "Node.js", "vsftpd": "vsftpd", "docker": "Docker", "postfix": "Postfix", "dovecot": "Dovecot", "fail2ban": "Fail2ban", "ufw": "UFW", "certbot": "Certbot", "git": "Git"}
+	name, known := names[id]
+	if !known {
+		return softwareRemovalPlan{}, errors.New("software is not in the verified ServerDeck catalog")
+	}
+	plan := softwareRemovalPlan{ID: id, Name: name, Allowed: true, Reason: "No managed dependency was found", Affected: []string{}}
+	sites, _ := listSites()
+	databases, _ := listDatabases()
+	switch id {
+	case "nginx", "apache2":
+		webServer := map[string]string{"nginx": "nginx", "apache2": "apache"}[id]
+		for _, item := range sites {
+			itemServer := item.WebServer
+			if itemServer == "" { itemServer = "nginx" }
+			if itemServer == webServer { plan.Affected = append(plan.Affected, item.Domain) }
+		}
+	case "nodejs":
+		for _, item := range sites { if item.Kind == "node" { plan.Affected = append(plan.Affected, item.Domain) } }
+	case "mariadb", "mysql", "postgresql":
+		engine := map[string]string{"mariadb": "MariaDB", "mysql": "MySQL", "postgresql": "PostgreSQL"}[id]
+		for _, item := range databases {
+			itemEngine := item.Engine
+			if itemEngine == "" { itemEngine = "MariaDB" }
+			if itemEngine == engine { plan.Affected = append(plan.Affected, item.Name) }
+		}
+	case "docker":
+		inventory, _ := inspectContainers()
+		for _, item := range inventory.Containers { plan.Affected = append(plan.Affected, item.Name) }
+	case "certbot":
+		statuses, _ := listTLS()
+		for _, item := range statuses { if item.Certificate { plan.Affected = append(plan.Affected, item.Domain) } }
+	case "postfix", "dovecot":
+		plan.Allowed = false
+		plan.Reason = "Mail components must be removed through a coordinated Email teardown workflow"
+	case "ufw":
+		plan.Allowed = false
+		plan.Reason = "Disable the firewall from Security; removing the firewall package is intentionally unavailable"
+	}
+	if len(plan.Affected) > 0 {
+		plan.Allowed = false
+		plan.Reason = fmt.Sprintf("%d managed item(s) still depend on %s", len(plan.Affected), name)
+	}
+	return plan, nil
+}
+
+func removeCatalogSoftware(id string) ([]softwarePackage, error) {
+	if os.Geteuid() != 0 {
+		return nil, errors.New("software-remove must run as root")
+	}
+	plan, err := planSoftwareRemoval(id)
+	if err != nil { return nil, err }
+	if !plan.Allowed { return nil, errors.New(plan.Reason) }
+	packages := map[string][]string{
+		"nginx": {"nginx"}, "apache2": {"apache2"}, "mariadb": {"mariadb-server"}, "mysql": {"mysql-server"},
+		"postgresql": {"postgresql"}, "redis": {"redis-server"}, "nodejs": {"nodejs", "npm"}, "vsftpd": {"vsftpd"},
+		"docker": {"docker-ce", "docker-ce-cli", "containerd.io", "docker-buildx-plugin", "docker-compose-plugin"},
+		"fail2ban": {"fail2ban"}, "certbot": {"certbot"}, "git": {"git"},
+	}
+	selection, ok := packages[id]
+	if !ok { return nil, errors.New("this software must be managed from its dedicated section") }
+	if id == "docker" && packageVersion("docker-ce") == "" { selection = []string{"docker.io"} }
+	_ = writeAudit("software.remove.started", true, id)
+	arguments := append([]string{"remove", "-y"}, selection...)
+	if output, err := exec.Command("apt-get", arguments...).CombinedOutput(); err != nil {
+		_ = writeAudit("software.remove.failed", false, id+": "+tail(string(output), 800))
+		return nil, fmt.Errorf("remove %s: %s", id, tail(string(output), 800))
+	}
+	_ = writeAudit("software.remove.completed", true, id)
+	return listSoftware()
 }
 
 func listPHPVersions() ([]phpVersionStatus, error) {
@@ -2267,24 +2879,38 @@ func switchPHP(domain, version string) (site, error) {
 	if _, err := os.Stat(socket); err != nil {
 		return value, errors.New("selected PHP-FPM version is not active")
 	}
+	webServer := value.WebServer
+	if webServer == "" {
+		webServer = "nginx"
+	}
 	configPath := filepath.Join("/etc/nginx/sites-available", domain)
+	if webServer == "apache" {
+		configPath = filepath.Join("/etc/apache2/sites-available", domain+".conf")
+	}
 	original, err := os.ReadFile(configPath)
 	if err != nil {
 		return value, err
 	}
 	updated := regexp.MustCompile(`fastcgi_pass unix:[^;]+;`).ReplaceAll(original, []byte("fastcgi_pass unix:"+socket+";"))
+	if webServer == "apache" {
+		updated = regexp.MustCompile(`proxy:unix:[^|]+\|fcgi://localhost/`).ReplaceAll(original, []byte("proxy:unix:"+socket+"|fcgi://localhost/"))
+	}
 	if err := atomicWrite(configPath, updated, 0644); err != nil {
 		return value, err
 	}
 	rollback := func() {
 		_ = atomicWrite(configPath, original, 0644)
-		_ = exec.Command("systemctl", "reload", "nginx").Run()
+		_ = exec.Command("systemctl", "reload", map[string]string{"nginx": "nginx", "apache": "apache2"}[webServer]).Run()
 	}
-	if output, err := exec.Command("nginx", "-t").CombinedOutput(); err != nil {
+	validation := exec.Command("nginx", "-t")
+	if webServer == "apache" {
+		validation = exec.Command("apache2ctl", "configtest")
+	}
+	if output, err := validation.CombinedOutput(); err != nil {
 		rollback()
-		return value, fmt.Errorf("nginx validation failed: %s", tail(string(output), 800))
+		return value, fmt.Errorf("%s validation failed: %s", webServer, tail(string(output), 800))
 	}
-	if err := exec.Command("systemctl", "reload", "nginx").Run(); err != nil {
+	if err := exec.Command("systemctl", "reload", map[string]string{"nginx": "nginx", "apache": "apache2"}[webServer]).Run(); err != nil {
 		rollback()
 		return value, err
 	}
@@ -2322,6 +2948,14 @@ func createNodeProject(domain string) (site, error) {
 	if _, err := exec.LookPath("node"); err != nil {
 		return value, errors.New("Node.js is not installed")
 	}
+	webServer := ""
+	if packageVersion("nginx") != "" && unitActive("nginx") {
+		webServer = "nginx"
+	} else if packageVersion("apache2") != "" && unitActive("apache2") {
+		webServer = "apache"
+	} else {
+		return value, errors.New("Nginx or Apache must be installed and running")
+	}
 	metadataPath := filepath.Join("/var/lib/serverdeck/sites", domain+".json")
 	if _, err := os.Stat(metadataPath); err == nil {
 		return value, errors.New("a managed site with this domain already exists")
@@ -2350,23 +2984,39 @@ func createNodeProject(domain string) (site, error) {
 	}
 	config := fmt.Sprintf("server {\n listen 80;\n listen [::]:80;\n server_name %s;\n location / {\n  proxy_pass http://127.0.0.1:%d;\n  proxy_set_header Host $host;\n  proxy_set_header X-Real-IP $remote_addr;\n  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n  proxy_set_header X-Forwarded-Proto $scheme;\n }\n}\n", domain, port)
 	configPath, enabledPath := filepath.Join("/etc/nginx/sites-available", domain), filepath.Join("/etc/nginx/sites-enabled", domain)
+	if webServer == "apache" {
+		if output, err := exec.Command("a2enmod", "proxy", "proxy_http", "headers").CombinedOutput(); err != nil {
+			return value, fmt.Errorf("enable Apache proxy modules: %s", tail(string(output), 800))
+		}
+		config = fmt.Sprintf("<VirtualHost *:80>\n ServerName %s\n ProxyPreserveHost On\n ProxyPass / http://127.0.0.1:%d/\n ProxyPassReverse / http://127.0.0.1:%d/\n RequestHeader set X-Forwarded-Proto expr=%%{REQUEST_SCHEME}\n</VirtualHost>\n", domain, port, port)
+		configPath = filepath.Join("/etc/apache2/sites-available", domain+".conf")
+		enabledPath = filepath.Join("/etc/apache2/sites-enabled", domain+".conf")
+	}
 	if err := atomicWrite(configPath, []byte(config), 0644); err != nil {
 		return value, err
 	}
-	if err := os.Symlink(configPath, enabledPath); err != nil {
-		return value, err
+	if webServer == "nginx" {
+		if err := os.Symlink(configPath, enabledPath); err != nil {
+			return value, err
+		}
+	} else if output, err := exec.Command("a2ensite", domain+".conf").CombinedOutput(); err != nil {
+		return value, fmt.Errorf("enable Apache site: %s", tail(string(output), 800))
 	}
 	_ = exec.Command("systemctl", "daemon-reload").Run()
 	if output, err := exec.Command("systemctl", "enable", "--now", serviceName).CombinedOutput(); err != nil {
 		return value, fmt.Errorf("start project: %s", tail(string(output), 800))
 	}
-	if output, err := exec.Command("nginx", "-t").CombinedOutput(); err != nil {
-		return value, fmt.Errorf("nginx validation failed: %s", tail(string(output), 800))
+	validation := exec.Command("nginx", "-t")
+	if webServer == "apache" {
+		validation = exec.Command("apache2ctl", "configtest")
 	}
-	if err := exec.Command("systemctl", "reload", "nginx").Run(); err != nil {
+	if output, err := validation.CombinedOutput(); err != nil {
+		return value, fmt.Errorf("%s validation failed: %s", webServer, tail(string(output), 800))
+	}
+	if err := exec.Command("systemctl", "reload", map[string]string{"nginx": "nginx", "apache": "apache2"}[webServer]).Run(); err != nil {
 		return value, err
 	}
-	value = site{Domain: domain, Kind: "node", Root: root, Enabled: true, NodeVersion: nodeVersion, Service: serviceName, Port: port, CreatedAt: time.Now().UTC().Format(time.RFC3339)}
+	value = site{Domain: domain, Kind: "node", Root: root, Enabled: true, NodeVersion: nodeVersion, Service: serviceName, Port: port, CreatedAt: time.Now().UTC().Format(time.RFC3339), WebServer: webServer}
 	encoded, _ := json.MarshalIndent(value, "", "  ")
 	if err := atomicWrite(metadataPath, append(encoded, '\n'), 0644); err != nil {
 		return site{}, err
@@ -2390,7 +3040,11 @@ func listSites() ([]site, error) {
 		if err := json.Unmarshal(data, &value); err != nil {
 			return nil, fmt.Errorf("decode %s: %w", path, err)
 		}
-		_, enabledErr := os.Lstat(filepath.Join("/etc/nginx/sites-enabled", value.Domain))
+		enabledPath := filepath.Join("/etc/nginx/sites-enabled", value.Domain)
+		if value.WebServer == "apache" {
+			enabledPath = filepath.Join("/etc/apache2/sites-enabled", value.Domain+".conf")
+		}
+		_, enabledErr := os.Lstat(enabledPath)
 		value.Enabled = enabledErr == nil
 		sites = append(sites, value)
 	}
@@ -2411,8 +3065,20 @@ func createSite(domain, kind string) (site, error) {
 		return value, errors.New("site kind must be static or php")
 	}
 
+	webServer := ""
+	if packageVersion("nginx") != "" && unitActive("nginx") {
+		webServer = "nginx"
+	} else if packageVersion("apache2") != "" && unitActive("apache2") {
+		webServer = "apache"
+	} else {
+		return value, errors.New("Nginx or Apache must be installed and running")
+	}
 	configPath := filepath.Join("/etc/nginx/sites-available", domain)
 	enabledPath := filepath.Join("/etc/nginx/sites-enabled", domain)
+	if webServer == "apache" {
+		configPath = filepath.Join("/etc/apache2/sites-available", domain+".conf")
+		enabledPath = filepath.Join("/etc/apache2/sites-enabled", domain+".conf")
+	}
 	metadataPath := filepath.Join("/var/lib/serverdeck/sites", domain+".json")
 	root := filepath.Join("/var/www", domain, "public")
 	for _, path := range []string{configPath, enabledPath, metadataPath} {
@@ -2431,16 +3097,25 @@ func createSite(domain, kind string) (site, error) {
 		sort.Strings(sockets)
 		socket := sockets[len(sockets)-1]
 		phpVersion = strings.TrimSuffix(strings.TrimPrefix(filepath.Base(socket), "php"), "-fpm.sock")
-		phpBlock = fmt.Sprintf(`
+		if webServer == "nginx" {
+			phpBlock = fmt.Sprintf(`
     index index.php index.html;
     location ~ \.php$ {
         include snippets/fastcgi-php.conf;
         fastcgi_pass unix:%s;
     }
 `, socket)
+		} else {
+			if output, err := exec.Command("a2enmod", "proxy_fcgi", "setenvif", "rewrite").CombinedOutput(); err != nil {
+				return value, fmt.Errorf("enable Apache PHP modules: %s", tail(string(output), 800))
+			}
+			phpBlock = fmt.Sprintf("    <FilesMatch \"\\.php$\">\n        SetHandler \"proxy:unix:%s|fcgi://localhost/\"\n    </FilesMatch>\n", socket)
+		}
 	}
 
-	config := fmt.Sprintf(`server {
+	config := ""
+	if webServer == "nginx" {
+		config = fmt.Sprintf(`server {
     listen 80;
     listen [::]:80;
     server_name %s;
@@ -2452,6 +3127,19 @@ func createSite(domain, kind string) (site, error) {
     }
 %s}
 `, domain, root, phpBlock)
+	} else {
+		config = fmt.Sprintf(`<VirtualHost *:80>
+    ServerName %s
+    DocumentRoot %s
+    <Directory %s>
+        Options FollowSymLinks
+        AllowOverride All
+        Require all granted
+        DirectoryIndex index.php index.html
+    </Directory>
+%s</VirtualHost>
+`, domain, root, root, phpBlock)
+	}
 
 	if err := os.MkdirAll(root, 0755); err != nil {
 		return value, fmt.Errorf("create document root: %w", err)
@@ -2468,25 +3156,34 @@ func createSite(domain, kind string) (site, error) {
 	if err := atomicWrite(configPath, []byte(config), 0644); err != nil {
 		return value, err
 	}
-	if err := os.Symlink(configPath, enabledPath); err != nil {
+	if webServer == "nginx" {
+		if err := os.Symlink(configPath, enabledPath); err != nil {
+			_ = os.Remove(configPath)
+			return value, fmt.Errorf("enable site: %w", err)
+		}
+	} else if output, err := exec.Command("a2ensite", domain+".conf").CombinedOutput(); err != nil {
 		_ = os.Remove(configPath)
-		return value, fmt.Errorf("enable site: %w", err)
+		return value, fmt.Errorf("enable Apache site: %s", tail(string(output), 800))
 	}
-	if output, err := exec.Command("nginx", "-t").CombinedOutput(); err != nil {
+	validation := exec.Command("nginx", "-t")
+	if webServer == "apache" {
+		validation = exec.Command("apache2ctl", "configtest")
+	}
+	if output, err := validation.CombinedOutput(); err != nil {
 		_ = os.Remove(enabledPath)
 		_ = os.Remove(configPath)
 		_ = writeAudit("site.create.failed", false, domain+": "+tail(string(output), 800))
-		return value, fmt.Errorf("nginx validation failed: %s", tail(string(output), 800))
+		return value, fmt.Errorf("%s validation failed: %s", webServer, tail(string(output), 800))
 	}
 
-	value = site{Domain: domain, Kind: kind, Root: root, Enabled: true, PHPVersion: phpVersion, CreatedAt: time.Now().UTC().Format(time.RFC3339)}
+	value = site{Domain: domain, Kind: kind, Root: root, Enabled: true, PHPVersion: phpVersion, CreatedAt: time.Now().UTC().Format(time.RFC3339), WebServer: webServer}
 	metadata, _ := json.MarshalIndent(value, "", "  ")
 	if err := atomicWrite(metadataPath, append(metadata, '\n'), 0644); err != nil {
 		_ = os.Remove(enabledPath)
 		_ = os.Remove(configPath)
 		return site{}, err
 	}
-	if output, err := exec.Command("systemctl", "reload", "nginx").CombinedOutput(); err != nil {
+	if output, err := exec.Command("systemctl", "reload", map[string]string{"nginx": "nginx", "apache": "apache2"}[webServer]).CombinedOutput(); err != nil {
 		_ = os.Remove(metadataPath)
 		_ = os.Remove(enabledPath)
 		_ = os.Remove(configPath)
@@ -2494,6 +3191,158 @@ func createSite(domain, kind string) (site, error) {
 	}
 	_ = writeAudit("site.create.completed", true, domain+" ("+kind+")")
 	return value, nil
+}
+
+func planWebMigration(target string) (webMigrationPlan, error) {
+	plan := webMigrationPlan{Target: target, Sites: []string{}, TLS: []string{}, SafetyBackup: true, Allowed: true}
+	if target != "nginx" && target != "apache" {
+		return plan, errors.New("migration target must be nginx or apache")
+	}
+	sites, err := listSites()
+	if err != nil { return plan, err }
+	sources := map[string]bool{}
+	for _, item := range sites {
+		source := item.WebServer
+		if source == "" { source = "nginx" }
+		sources[source] = true
+		plan.Sites = append(plan.Sites, item.Domain)
+		if _, err := os.Stat(filepath.Join("/etc/letsencrypt/live", item.Domain, "cert.pem")); err == nil {
+			plan.TLS = append(plan.TLS, item.Domain)
+		}
+	}
+	if len(sites) == 0 {
+		plan.Allowed = false
+		plan.Reason = "No managed websites need migration"
+		return plan, nil
+	}
+	if len(sources) != 1 {
+		plan.Allowed = false
+		plan.Reason = "Managed sites currently use mixed web servers; migrate them to one server before switching"
+		return plan, nil
+	}
+	for source := range sources { plan.Source = source }
+	if plan.Source == target {
+		plan.Allowed = false
+		plan.Reason = "Managed websites already use " + target
+		return plan, nil
+	}
+	plan.Reason = fmt.Sprintf("Migrate %d managed website(s), including %d TLS site(s)", len(plan.Sites), len(plan.TLS))
+	return plan, nil
+}
+
+func migrateWebServer(target string) (webMigrationPlan, error) {
+	if os.Geteuid() != 0 { return webMigrationPlan{}, errors.New("web-migrate must run as root") }
+	plan, err := planWebMigration(target)
+	if err != nil { return plan, err }
+	if !plan.Allowed { return plan, errors.New(plan.Reason) }
+	safety, err := createBackup()
+	if err != nil { return plan, fmt.Errorf("create migration safety backup: %w", err) }
+	_ = writeAudit("web.migration.started", true, plan.Source+" -> "+target+" safety "+safety.ID)
+	sourceUnit := map[string]string{"nginx": "nginx", "apache": "apache2"}[plan.Source]
+	targetUnit := map[string]string{"nginx": "nginx", "apache": "apache2"}[target]
+	created := []string{}
+	metadataOriginals := map[string][]byte{}
+	rollback := func(detail string) {
+		_ = exec.Command("systemctl", "stop", targetUnit).Run()
+		for _, path := range created { _ = os.Remove(path) }
+		for path, contents := range metadataOriginals { _ = atomicWrite(path, contents, 0644) }
+		_ = exec.Command("systemctl", "start", sourceUnit).Run()
+		_ = writeAudit("web.migration.rolled-back", false, detail+" safety "+safety.ID)
+	}
+	if err := exec.Command("systemctl", "stop", sourceUnit).Run(); err != nil {
+		return plan, fmt.Errorf("stop %s before migration: %w", plan.Source, err)
+	}
+	packages := []string{"nginx", "certbot", "python3-certbot-nginx"}
+	if target == "apache" { packages = []string{"apache2", "certbot", "python3-certbot-apache"} }
+	arguments := append([]string{"install", "-y", "--no-install-recommends"}, packages...)
+	if output, installErr := exec.Command("apt-get", arguments...).CombinedOutput(); installErr != nil {
+		rollback("install target: "+tail(string(output), 800))
+		return plan, fmt.Errorf("install %s: %s", target, tail(string(output), 800))
+	}
+	if target == "apache" {
+		if output, moduleErr := exec.Command("a2enmod", "proxy", "proxy_http", "proxy_fcgi", "setenvif", "rewrite", "headers", "ssl").CombinedOutput(); moduleErr != nil {
+			rollback("enable Apache modules: "+tail(string(output), 800))
+			return plan, fmt.Errorf("enable Apache modules: %s", tail(string(output), 800))
+		}
+	}
+	sites, _ := listSites()
+	for _, item := range sites {
+		config, renderErr := renderSiteForWebServer(item, target)
+		if renderErr != nil { rollback(renderErr.Error()); return plan, renderErr }
+		configPath := filepath.Join("/etc/nginx/sites-available", item.Domain)
+		enabledPath := filepath.Join("/etc/nginx/sites-enabled", item.Domain)
+		if target == "apache" {
+			configPath = filepath.Join("/etc/apache2/sites-available", item.Domain+".conf")
+			enabledPath = filepath.Join("/etc/apache2/sites-enabled", item.Domain+".conf")
+		}
+		if _, statErr := os.Lstat(configPath); statErr == nil {
+			rollback("target configuration already exists for "+item.Domain)
+			return plan, errors.New("target configuration already exists for " + item.Domain)
+		}
+		if writeErr := atomicWrite(configPath, []byte(config), 0644); writeErr != nil { rollback(writeErr.Error()); return plan, writeErr }
+		created = append(created, configPath)
+		if symlinkErr := os.Symlink(configPath, enabledPath); symlinkErr != nil { rollback(symlinkErr.Error()); return plan, symlinkErr }
+		created = append(created, enabledPath)
+	}
+	validation := exec.Command("nginx", "-t")
+	if target == "apache" { validation = exec.Command("apache2ctl", "configtest") }
+	if output, validationErr := validation.CombinedOutput(); validationErr != nil {
+		rollback("validation: "+tail(string(output), 1000))
+		return plan, fmt.Errorf("%s validation failed: %s", target, tail(string(output), 1000))
+	}
+	if output, startErr := exec.Command("systemctl", "enable", "--now", targetUnit).CombinedOutput(); startErr != nil {
+		rollback("start target: "+tail(string(output), 800))
+		return plan, fmt.Errorf("start %s: %s", target, tail(string(output), 800))
+	}
+	for _, item := range sites {
+		item.WebServer = target
+		metadataPath := filepath.Join("/var/lib/serverdeck/sites", item.Domain+".json")
+		if original, readErr := os.ReadFile(metadataPath); readErr == nil { metadataOriginals[metadataPath] = original }
+		encoded, _ := json.MarshalIndent(item, "", "  ")
+		if metadataErr := atomicWrite(metadataPath, append(encoded, '\n'), 0644); metadataErr != nil {
+			rollback(metadataErr.Error())
+			return plan, metadataErr
+		}
+	}
+	_ = writeAudit("web.migration.completed", true, plan.Source+" -> "+target+" safety "+safety.ID)
+	return plan, nil
+}
+
+func renderSiteForWebServer(item site, target string) (string, error) {
+	tls := false
+	certificatePath := filepath.Join("/etc/letsencrypt/live", item.Domain)
+	if _, err := os.Stat(filepath.Join(certificatePath, "cert.pem")); err == nil { tls = true }
+	if target == "nginx" {
+		listenTLS := ""
+		if tls { listenTLS = fmt.Sprintf("    listen 443 ssl;\n    listen [::]:443 ssl;\n    ssl_certificate %s/fullchain.pem;\n    ssl_certificate_key %s/privkey.pem;\n", certificatePath, certificatePath) }
+		if item.Kind == "node" {
+			return fmt.Sprintf("server {\n    listen 80;\n    listen [::]:80;\n%s    server_name %s;\n    location / {\n        proxy_pass http://127.0.0.1:%d;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n    }\n}\n", listenTLS, item.Domain, item.Port), nil
+		}
+		phpBlock := ""
+		if item.Kind == "php" {
+			socket := "/run/php/php"+item.PHPVersion+"-fpm.sock"
+			if _, err := os.Stat(socket); err != nil { return "", errors.New("PHP-FPM socket is unavailable for "+item.Domain) }
+			phpBlock = fmt.Sprintf("    location ~ \\.php$ {\n        include snippets/fastcgi-php.conf;\n        fastcgi_pass unix:%s;\n    }\n", socket)
+		}
+		return fmt.Sprintf("server {\n    listen 80;\n    listen [::]:80;\n%s    server_name %s;\n    root %s;\n    index index.php index.html;\n    location / { try_files $uri $uri/ /index.html; }\n%s}\n", listenTLS, item.Domain, item.Root, phpBlock), nil
+	}
+	if target != "apache" { return "", errors.New("unsupported migration target") }
+	body := ""
+	if item.Kind == "node" {
+		body = fmt.Sprintf("    ProxyPreserveHost On\n    ProxyPass / http://127.0.0.1:%d/\n    ProxyPassReverse / http://127.0.0.1:%d/\n    RequestHeader set X-Forwarded-Proto expr=%%{REQUEST_SCHEME}\n", item.Port, item.Port)
+	} else {
+		body = fmt.Sprintf("    DocumentRoot %s\n    <Directory %s>\n        Options FollowSymLinks\n        AllowOverride All\n        Require all granted\n        DirectoryIndex index.php index.html\n    </Directory>\n", item.Root, item.Root)
+		if item.Kind == "php" {
+			socket := "/run/php/php"+item.PHPVersion+"-fpm.sock"
+			if _, err := os.Stat(socket); err != nil { return "", errors.New("PHP-FPM socket is unavailable for "+item.Domain) }
+			body += fmt.Sprintf("    <FilesMatch \"\\.php$\">\n        SetHandler \"proxy:unix:%s|fcgi://localhost/\"\n    </FilesMatch>\n", socket)
+		}
+	}
+	config := fmt.Sprintf("<VirtualHost *:80>\n    ServerName %s\n%s</VirtualHost>\n", item.Domain, body)
+	if tls {
+		config += fmt.Sprintf("<VirtualHost *:443>\n    ServerName %s\n    SSLEngine on\n    SSLCertificateFile %s/fullchain.pem\n    SSLCertificateKeyFile %s/privkey.pem\n%s</VirtualHost>\n", item.Domain, certificatePath, certificatePath, body)
+	}
+	return config, nil
 }
 
 func atomicWrite(path string, data []byte, mode os.FileMode) error {
@@ -2524,7 +3373,7 @@ func atomicWrite(path string, data []byte, mode os.FileMode) error {
 	return os.Rename(temporary, path)
 }
 
-func installWebStack() (map[string]interface{}, error) {
+func installWebStack(webServer, database string, php, node, redis, ftp, fail2ban, firewall bool, sshPort int) (map[string]interface{}, error) {
 	if os.Geteuid() != 0 {
 		return nil, errors.New("stack-install must run as root")
 	}
@@ -2532,28 +3381,127 @@ func installWebStack() (map[string]interface{}, error) {
 		return nil, errors.New("apt-get is required")
 	}
 
-	if err := writeAudit("stack.install.started", true, "web stack installation started"); err != nil {
+	webPackages := map[string][]string{
+		"nginx": {"nginx", "certbot", "python3-certbot-nginx"},
+		"apache": {"apache2", "certbot", "python3-certbot-apache"},
+		"none": {},
+	}
+	databasePackages := map[string][]string{
+		"mariadb": {"mariadb-server"},
+		"mysql": {"mysql-server"},
+		"postgresql": {"postgresql"},
+		"none": {},
+	}
+	packages, validWeb := webPackages[webServer]
+	databaseSelection, validDatabase := databasePackages[database]
+	if !validWeb || !validDatabase {
+		return nil, errors.New("unsupported hosting stack selection")
+	}
+	if sshPort < 1 || sshPort > 65535 {
+		return nil, errors.New("SSH port must be between 1 and 65535")
+	}
+	if webServer == "nginx" && packageVersion("apache2") != "" {
+		return nil, errors.New("Apache is already installed. Remove or migrate it before selecting Nginx")
+	}
+	if webServer == "apache" && packageVersion("nginx") != "" {
+		return nil, errors.New("Nginx is already installed. Remove or migrate it before selecting Apache")
+	}
+	if database == "mariadb" && packageVersion("mysql-server") != "" {
+		return nil, errors.New("MySQL is already installed. MariaDB cannot be installed beside it safely")
+	}
+	if database == "mysql" && packageVersion("mariadb-server") != "" {
+		return nil, errors.New("MariaDB is already installed. MySQL cannot be installed beside it safely")
+	}
+	if database == "postgresql" && (packageVersion("mariadb-server") != "" || packageVersion("mysql-server") != "") {
+		return nil, errors.New("A MySQL-compatible database is already installed. Choose one managed database engine per server")
+	}
+	if (database == "mariadb" || database == "mysql") && packageVersion("postgresql") != "" {
+		return nil, errors.New("PostgreSQL is already installed. Choose one managed database engine per server")
+	}
+	packages = append(packages, databaseSelection...)
+	if php {
+		packages = append(packages, "php-fpm", "php-cli", "php-curl", "php-mbstring", "php-xml", "php-zip")
+	}
+	if php && (database == "mariadb" || database == "mysql") {
+		packages = append(packages, "php-mysql")
+	}
+	if php && database == "postgresql" {
+		packages = append(packages, "php-pgsql")
+	}
+	if node {
+		packages = append(packages, "nodejs", "npm")
+	}
+	if redis {
+		packages = append(packages, "redis-server")
+	}
+	if ftp {
+		packages = append(packages, "vsftpd")
+	}
+	if fail2ban {
+		packages = append(packages, "fail2ban")
+	}
+	if len(packages) == 0 {
+		return map[string]interface{}{"installed": []string{}}, nil
+	}
+
+	if err := writeAudit("stack.install.started", true, fmt.Sprintf("web=%s database=%s php=%t node=%t redis=%t ftp=%t", webServer, database, php, node, redis, ftp)); err != nil {
 		return nil, err
 	}
 	if output, err := exec.Command("apt-get", "update").CombinedOutput(); err != nil {
 		_ = writeAudit("stack.install.failed", false, tail(string(output), 800))
 		return nil, fmt.Errorf("apt-get update failed: %s", tail(string(output), 800))
 	}
-	arguments := append([]string{"install", "-y", "--no-install-recommends"}, webStackPackages...)
+	arguments := append([]string{"install", "-y", "--no-install-recommends"}, packages...)
 	if output, err := exec.Command("apt-get", arguments...).CombinedOutput(); err != nil {
 		_ = writeAudit("stack.install.failed", false, tail(string(output), 800))
 		return nil, fmt.Errorf("package installation failed: %s", tail(string(output), 800))
 	}
-	for _, name := range []string{"nginx", "mariadb"} {
+	units := []string{}
+	if webServer == "nginx" {
+		units = append(units, "nginx")
+	}
+	if webServer == "apache" {
+		units = append(units, "apache2")
+	}
+	if database == "mariadb" {
+		units = append(units, "mariadb")
+	}
+	if database == "mysql" {
+		units = append(units, "mysql")
+	}
+	if database == "postgresql" {
+		units = append(units, "postgresql")
+	}
+	if redis {
+		units = append(units, "redis-server")
+	}
+	if ftp {
+		units = append(units, "vsftpd")
+	}
+	for _, name := range units {
 		if output, err := exec.Command("systemctl", "enable", "--now", name).CombinedOutput(); err != nil {
 			_ = writeAudit("stack.install.failed", false, tail(string(output), 800))
 			return nil, fmt.Errorf("enable %s: %s", name, tail(string(output), 800))
 		}
 	}
+	if fail2ban {
+		configuration := "[sshd]\nenabled = true\nbackend = systemd\nmaxretry = 5\nfindtime = 10m\nbantime = 1h\n"
+		if err := atomicWrite("/etc/fail2ban/jail.d/serverdeck.local", []byte(configuration), 0644); err != nil {
+			return nil, err
+		}
+		if output, err := exec.Command("systemctl", "enable", "--now", "fail2ban").CombinedOutput(); err != nil {
+			return nil, fmt.Errorf("enable Fail2ban: %s", tail(string(output), 800))
+		}
+	}
+	if firewall {
+		if _, err := enableFirewall(sshPort); err != nil {
+			return nil, err
+		}
+	}
 	if err := writeAudit("stack.install.completed", true, "web stack installation completed"); err != nil {
 		return nil, err
 	}
-	return map[string]interface{}{"installed": webStackPackages}, nil
+	return map[string]interface{}{"installed": packages, "web_server": webServer, "database": database, "fail2ban": fail2ban, "firewall": firewall}, nil
 }
 
 func writeAudit(action string, success bool, detail string) error {
