@@ -26,7 +26,7 @@ import (
 
 
 const (
-	version         = "0.24.2"
+	version         = "0.24.3"
 	protocolVersion = 1
 )
 
@@ -181,6 +181,13 @@ type managedFile struct {
 type fileContents struct {
 	Path    string `json:"path"`
 	Content string `json:"content"`
+}
+
+type trashEntry struct {
+	TrashName    string `json:"trash_name"`
+	OriginalPath string `json:"original_path"`
+	DeletedAt    string `json:"deleted_at"`
+	Directory    bool   `json:"directory"`
 }
 
 type containerStatus struct {
@@ -543,11 +550,29 @@ func main() {
 		}
 		data, err = writeManagedFileEncoded(os.Args[2], os.Args[3], os.Args[4])
 	case "file-delete":
-		if len(os.Args) != 4 {
-			err = errors.New("file-delete requires an encoded domain and path")
+		if len(os.Args) != 5 {
+			err = errors.New("file-delete requires an encoded domain, path, and permanent flag")
 			break
 		}
-		data, err = deleteManagedFileEncoded(os.Args[2], os.Args[3])
+		data, err = deleteManagedFileEncoded(os.Args[2], os.Args[3], os.Args[4])
+	case "file-trash-list":
+		if len(os.Args) != 3 {
+			err = errors.New("file-trash-list requires an encoded domain")
+			break
+		}
+		data, err = listTrashedFilesEncoded(os.Args[2])
+	case "file-trash-restore":
+		if len(os.Args) != 4 {
+			err = errors.New("file-trash-restore requires an encoded domain and trash name")
+			break
+		}
+		data, err = restoreTrashedFileEncoded(os.Args[2], os.Args[3])
+	case "file-trash-empty":
+		if len(os.Args) != 3 {
+			err = errors.New("file-trash-empty requires an encoded domain")
+			break
+		}
+		data, err = emptyTrashEncoded(os.Args[2])
 	case "file-create-dir":
 		if len(os.Args) != 4 {
 			err = errors.New("file-create-dir requires an encoded domain and path")
@@ -2178,6 +2203,9 @@ func listManagedFilesEncoded(domain, path string) ([]managedFile, error) {
 	}
 	values := []managedFile{}
 	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
 		info, infoErr := entry.Info()
 		if infoErr != nil || info.Mode()&os.ModeSymlink != 0 {
 			continue
@@ -2256,9 +2284,13 @@ func writeManagedFileEncoded(domain, path, encodedContent string) (fileContents,
 	return readManagedFileEncoded(domain, path)
 }
 
-func deleteManagedFileEncoded(domain, path string) ([]managedFile, error) {
+func deleteManagedFileEncoded(domain, path, permanentStr string) ([]managedFile, error) {
 	if os.Geteuid() != 0 {
 		return nil, errors.New("file-delete must run as root")
+	}
+	permanent := false
+	if permanentStr == "true" {
+		permanent = true
 	}
 	root, target, err := managedSitePath(domain, path)
 	if err != nil {
@@ -2274,12 +2306,170 @@ func deleteManagedFileEncoded(domain, path string) ([]managedFile, error) {
 	if info.Mode()&os.ModeSymlink != 0 {
 		return nil, errors.New("symbolic links are not managed")
 	}
-	if err := os.Remove(target); err != nil {
-		return nil, errors.New("only files and empty folders can be deleted")
+
+	if permanent {
+		if err := os.RemoveAll(target); err != nil {
+			return nil, err
+		}
+		_ = writeAudit("file.deleted_permanently", true, target)
+	} else {
+		trashDir := filepath.Join(root, ".trash")
+		if err := os.MkdirAll(trashDir, 0755); err != nil {
+			return nil, err
+		}
+		if stat, err := os.Stat(root); err == nil {
+			if sysStat, ok := stat.Sys().(*syscall.Stat_t); ok {
+				_ = os.Chown(trashDir, int(sysStat.Uid), int(sysStat.Gid))
+			}
+		}
+
+		timestamp := time.Now().UnixNano()
+		name := filepath.Base(target)
+		trashName := fmt.Sprintf("%s_%d", name, timestamp)
+		trashPath := filepath.Join(trashDir, trashName)
+
+		if err := os.Rename(target, trashPath); err != nil {
+			return nil, err
+		}
+
+		manifestPath := filepath.Join(trashDir, "manifest.json")
+		var manifest []trashEntry
+		if bytes, err := os.ReadFile(manifestPath); err == nil {
+			_ = json.Unmarshal(bytes, &manifest)
+		}
+		
+		relative, _ := filepath.Rel(root, target)
+		manifest = append(manifest, trashEntry{
+			TrashName:    trashName,
+			OriginalPath: filepath.ToSlash(relative),
+			DeletedAt:    time.Now().UTC().Format(time.RFC3339),
+			Directory:    info.IsDir(),
+		})
+
+		if data, err := json.MarshalIndent(manifest, "", "  "); err == nil {
+			_ = atomicWrite(manifestPath, append(data, '\n'), 0644)
+			if stat, err := os.Stat(trashDir); err == nil {
+				if sysStat, ok := stat.Sys().(*syscall.Stat_t); ok {
+					_ = os.Chown(manifestPath, int(sysStat.Uid), int(sysStat.Gid))
+				}
+			}
+		}
+		_ = writeAudit("file.trashed", true, target)
 	}
-	_ = writeAudit("file.deleted", true, target)
+
 	parent, _ := filepath.Rel(root, filepath.Dir(target))
+	if parent == "." {
+		parent = ""
+	}
 	return listManagedFilesEncoded(domain, base64.RawURLEncoding.EncodeToString([]byte(parent)))
+}
+
+func listTrashedFilesEncoded(domain string) ([]trashEntry, error) {
+	root, _, err := managedSitePath(domain, "")
+	if err != nil {
+		return nil, err
+	}
+	manifestPath := filepath.Join(root, ".trash", "manifest.json")
+	var manifest []trashEntry
+	if bytes, err := os.ReadFile(manifestPath); err == nil {
+		_ = json.Unmarshal(bytes, &manifest)
+	} else {
+		manifest = []trashEntry{}
+	}
+	return manifest, nil
+}
+
+func restoreTrashedFileEncoded(domain, trashName string) ([]trashEntry, error) {
+	if os.Geteuid() != 0 {
+		return nil, errors.New("file-trash-restore must run as root")
+	}
+	decodedTrashName, err := decodeArgument(trashName)
+	if err != nil {
+		return nil, err
+	}
+	root, _, err := managedSitePath(domain, "")
+	if err != nil {
+		return nil, err
+	}
+	trashDir := filepath.Join(root, ".trash")
+	manifestPath := filepath.Join(trashDir, "manifest.json")
+	
+	var manifest []trashEntry
+	if bytes, err := os.ReadFile(manifestPath); err == nil {
+		_ = json.Unmarshal(bytes, &manifest)
+	} else {
+		return nil, errors.New("trash manifest not found")
+	}
+
+	foundIdx := -1
+	var entry trashEntry
+	for i, item := range manifest {
+		if item.TrashName == decodedTrashName {
+			foundIdx = i
+			entry = item
+			break
+		}
+	}
+
+	if foundIdx == -1 {
+		return nil, errors.New("item not found in trash")
+	}
+
+	trashPath := filepath.Join(trashDir, decodedTrashName)
+	originalPath := filepath.Join(root, entry.OriginalPath)
+
+	if _, err := os.Stat(originalPath); err == nil {
+		return nil, fmt.Errorf("an item already exists at original location: %s", entry.OriginalPath)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(originalPath), 0755); err != nil {
+		return nil, err
+	}
+
+	if err := os.Rename(trashPath, originalPath); err != nil {
+		return nil, err
+	}
+
+	manifest = append(manifest[:foundIdx], manifest[foundIdx+1:]...)
+	if data, err := json.MarshalIndent(manifest, "", "  "); err == nil {
+		_ = atomicWrite(manifestPath, append(data, '\n'), 0644)
+	}
+	_ = writeAudit("file.restored", true, originalPath)
+
+	return manifest, nil
+}
+
+func emptyTrashEncoded(domain string) ([]trashEntry, error) {
+	if os.Geteuid() != 0 {
+		return nil, errors.New("file-trash-empty must run as root")
+	}
+	root, _, err := managedSitePath(domain, "")
+	if err != nil {
+		return nil, err
+	}
+	trashDir := filepath.Join(root, ".trash")
+	if _, err := os.Stat(trashDir); err != nil {
+		return []trashEntry{}, nil
+	}
+	
+	entries, err := os.ReadDir(trashDir)
+	if err == nil {
+		for _, entry := range entries {
+			_ = os.RemoveAll(filepath.Join(trashDir, entry.Name()))
+		}
+	}
+	
+	manifestPath := filepath.Join(trashDir, "manifest.json")
+	_ = atomicWrite(manifestPath, []byte("[]\n"), 0644)
+	
+	if stat, err := os.Stat(trashDir); err == nil {
+		if sysStat, ok := stat.Sys().(*syscall.Stat_t); ok {
+			_ = os.Chown(manifestPath, int(sysStat.Uid), int(sysStat.Gid))
+		}
+	}
+	
+	_ = writeAudit("file.trash_emptied", true, trashDir)
+	return []trashEntry{}, nil
 }
 
 func createManagedDirEncoded(domain, path string) ([]managedFile, error) {
