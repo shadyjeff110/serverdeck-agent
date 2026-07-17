@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	version         = "0.29.0"
+	version         = "0.30.0"
 	protocolVersion = 1
 )
 
@@ -846,6 +846,71 @@ func main() {
 			break
 		}
 		data, err = composeDown(name)
+	case "wp-list":
+		data, err = listWordPressSites()
+	case "wp-settings-get":
+		if len(os.Args) != 3 {
+			err = errors.New("wp-settings-get requires an encoded domain")
+			break
+		}
+		domain, decodeErr := decodeArgument(os.Args[2])
+		if decodeErr != nil {
+			err = decodeErr
+			break
+		}
+		data, err = getWordPressSite(domain)
+	case "wp-settings-set":
+		if len(os.Args) != 4 {
+			err = errors.New("wp-settings-set requires an encoded domain and settings")
+			break
+		}
+		domain, domainErr := decodeArgument(os.Args[2])
+		settings, settingsErr := decodeArgument(os.Args[3])
+		if domainErr != nil {
+			err = domainErr
+			break
+		}
+		if settingsErr != nil {
+			err = settingsErr
+			break
+		}
+		data, err = updateWordPressSettings(domain, settings)
+	case "wp-user-password":
+		if len(os.Args) != 5 {
+			err = errors.New("wp-user-password requires an encoded domain, login, and password")
+			break
+		}
+		domain, domainErr := decodeArgument(os.Args[2])
+		login, loginErr := decodeArgument(os.Args[3])
+		password, passwordErr := decodeArgument(os.Args[4])
+		if domainErr != nil {
+			err = domainErr
+			break
+		}
+		if loginErr != nil {
+			err = loginErr
+			break
+		}
+		if passwordErr != nil {
+			err = passwordErr
+			break
+		}
+		if resetErr := resetWordPressPassword(domain, login, password); resetErr != nil {
+			err = resetErr
+			break
+		}
+		data = map[string]bool{"reset": true}
+	case "wp-core-update":
+		if len(os.Args) != 3 {
+			err = errors.New("wp-core-update requires an encoded domain")
+			break
+		}
+		domain, decodeErr := decodeArgument(os.Args[2])
+		if decodeErr != nil {
+			err = decodeErr
+			break
+		}
+		data, err = updateWordPressCore(domain)
 	case "php-version-list":
 		data, err = listPHPVersions()
 	case "php-version-install":
