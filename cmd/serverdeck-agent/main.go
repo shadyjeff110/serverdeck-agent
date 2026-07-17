@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	version         = "0.28.0"
+	version         = "0.29.0"
 	protocolVersion = 1
 )
 
@@ -732,6 +732,120 @@ func main() {
 			break
 		}
 		data, err = containerLogsEncoded(os.Args[2], os.Args[3])
+	case "image-list":
+		data, err = listImages()
+	case "image-pull":
+		if len(os.Args) != 3 {
+			err = errors.New("image-pull requires an encoded image reference")
+			break
+		}
+		ref, decodeErr := decodeArgument(os.Args[2])
+		if decodeErr != nil {
+			err = decodeErr
+			break
+		}
+		data, err = pullImage(ref)
+	case "image-remove":
+		if len(os.Args) != 3 {
+			err = errors.New("image-remove requires an encoded image reference")
+			break
+		}
+		ref, decodeErr := decodeArgument(os.Args[2])
+		if decodeErr != nil {
+			err = decodeErr
+			break
+		}
+		data, err = removeImage(ref)
+	case "container-create":
+		if len(os.Args) != 3 {
+			err = errors.New("container-create requires an encoded spec")
+			break
+		}
+		spec, decodeErr := decodeArgument(os.Args[2])
+		if decodeErr != nil {
+			err = decodeErr
+			break
+		}
+		data, err = createContainer(spec)
+	case "container-remove":
+		if len(os.Args) != 3 {
+			err = errors.New("container-remove requires an encoded container name")
+			break
+		}
+		name, decodeErr := decodeArgument(os.Args[2])
+		if decodeErr != nil {
+			err = decodeErr
+			break
+		}
+		data, err = removeContainer(name)
+	case "container-publish":
+		if len(os.Args) != 4 {
+			err = errors.New("container-publish requires an encoded domain and host port")
+			break
+		}
+		domain, domainErr := decodeArgument(os.Args[2])
+		portValue, portErr := decodeArgument(os.Args[3])
+		if domainErr != nil {
+			err = domainErr
+			break
+		}
+		if portErr != nil {
+			err = portErr
+			break
+		}
+		port, parseErr := parsePort(portValue)
+		if parseErr != nil {
+			err = parseErr
+			break
+		}
+		data, err = publishContainer(domain, port)
+	case "docker-catalog":
+		data = dockerCatalog()
+	case "docker-app-install":
+		if len(os.Args) != 4 {
+			err = errors.New("docker-app-install requires an encoded app id and options")
+			break
+		}
+		appID, idErr := decodeArgument(os.Args[2])
+		options, optionsErr := decodeArgument(os.Args[3])
+		if idErr != nil {
+			err = idErr
+			break
+		}
+		if optionsErr != nil {
+			err = optionsErr
+			break
+		}
+		data, err = installDockerApp(appID, options)
+	case "compose-list":
+		data, err = listComposeProjects()
+	case "compose-up":
+		if len(os.Args) != 4 {
+			err = errors.New("compose-up requires an encoded project name and file")
+			break
+		}
+		name, nameErr := decodeArgument(os.Args[2])
+		content, contentErr := decodeArgument(os.Args[3])
+		if nameErr != nil {
+			err = nameErr
+			break
+		}
+		if contentErr != nil {
+			err = contentErr
+			break
+		}
+		data, err = composeUp(name, content)
+	case "compose-down":
+		if len(os.Args) != 3 {
+			err = errors.New("compose-down requires an encoded project name")
+			break
+		}
+		name, decodeErr := decodeArgument(os.Args[2])
+		if decodeErr != nil {
+			err = decodeErr
+			break
+		}
+		data, err = composeDown(name)
 	case "php-version-list":
 		data, err = listPHPVersions()
 	case "php-version-install":
@@ -4670,7 +4784,7 @@ func renderSiteForWebServer(item site, target string) (string, error) {
 		if tls {
 			listenTLS = fmt.Sprintf("    listen 443 ssl;\n    listen [::]:443 ssl;\n    ssl_certificate %s/fullchain.pem;\n    ssl_certificate_key %s/privkey.pem;\n", certificatePath, certificatePath)
 		}
-		if item.Kind == "node" {
+		if item.Kind == "node" || item.Kind == "proxy" {
 			return fmt.Sprintf("server {\n    listen 80;\n    listen [::]:80;\n%s    server_name %s;\n    location / {\n        proxy_pass http://127.0.0.1:%d;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n    }\n}\n", listenTLS, item.Domain, item.Port), nil
 		}
 		phpBlock := ""
@@ -4691,7 +4805,7 @@ func renderSiteForWebServer(item site, target string) (string, error) {
 		return "", errors.New("unsupported migration target")
 	}
 	body := ""
-	if item.Kind == "node" {
+	if item.Kind == "node" || item.Kind == "proxy" {
 		body = fmt.Sprintf("    ProxyPreserveHost On\n    ProxyPass / http://127.0.0.1:%d/\n    ProxyPassReverse / http://127.0.0.1:%d/\n    RequestHeader set X-Forwarded-Proto expr=%%{REQUEST_SCHEME}\n", item.Port, item.Port)
 	} else {
 		body = fmt.Sprintf("    DocumentRoot %s\n    <Directory %s>\n        Options FollowSymLinks\n        AllowOverride All\n        Require all granted\n        DirectoryIndex index.php index.html\n    </Directory>\n", item.Root, item.Root)
