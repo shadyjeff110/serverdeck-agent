@@ -26,7 +26,7 @@ import (
 
 
 const (
-	version         = "0.24.7"
+	version         = "0.24.8"
 	protocolVersion = 1
 )
 
@@ -1820,15 +1820,22 @@ func issueTLS(domain, email string) (tlsStatus, error) {
 		return readiness, err
 	}
 	_ = writeAudit("tls.issue.started", true, domain)
-	arguments := []string{"certonly", "--nginx", "--non-interactive", "--agree-tos", "--keep-until-expiring", "--email", email, "--domain", domain}
+	arguments := []string{"certonly", "--nginx", "--non-interactive", "--agree-tos", "--keep-until-expiring", "--email", email, "--domain", domain, "--domain", "www." + domain}
 	if webServer == "apache" {
-		arguments = []string{"--apache", "--non-interactive", "--agree-tos", "--keep-until-expiring", "--redirect", "--email", email, "--domain", domain}
+		arguments = []string{"--apache", "--non-interactive", "--agree-tos", "--keep-until-expiring", "--redirect", "--email", email, "--domain", domain, "--domain", "www." + domain}
 	}
 	if output, err := exec.Command("certbot", arguments...).CombinedOutput(); err != nil {
-		_ = atomicWrite(configPath, original, 0644)
-		_ = exec.Command("systemctl", "reload", map[string]string{"nginx": "nginx", "apache": "apache2"}[webServer]).Run()
-		_ = writeAudit("tls.issue.failed", false, domain+": "+tail(string(output), 800))
-		return readiness, fmt.Errorf("Certbot failed: %s", tail(string(output), 800))
+		// Fallback: try issuing only for the apex domain in case www is not pointed
+		fallbackArgs := []string{"certonly", "--nginx", "--non-interactive", "--agree-tos", "--keep-until-expiring", "--email", email, "--domain", domain}
+		if webServer == "apache" {
+			fallbackArgs = []string{"--apache", "--non-interactive", "--agree-tos", "--keep-until-expiring", "--redirect", "--email", email, "--domain", domain}
+		}
+		if fallbackOutput, fallbackErr := exec.Command("certbot", fallbackArgs...).CombinedOutput(); fallbackErr != nil {
+			_ = atomicWrite(configPath, original, 0644)
+			_ = exec.Command("systemctl", "reload", map[string]string{"nginx": "nginx", "apache": "apache2"}[webServer]).Run()
+			_ = writeAudit("tls.issue.failed", false, domain+": "+tail(string(output)+"\nFallback: "+string(fallbackOutput), 800))
+			return readiness, fmt.Errorf("Certbot failed: %s", tail(string(output), 800))
+		}
 	}
 	if webServer == "apache" {
 		if output, err := exec.Command("apache2ctl", "configtest").CombinedOutput(); err != nil {
@@ -4171,7 +4178,7 @@ func createSite(domain, kind string) (site, error) {
 		config = fmt.Sprintf(`server {
     listen 80;
     listen [::]:80;
-    server_name %s;
+    server_name %s www.%s;
     root %s;
     index index.html;
 
@@ -4179,10 +4186,11 @@ func createSite(domain, kind string) (site, error) {
         try_files $uri $uri/ %s;
     }
 %s}
-`, domain, root, fallback, phpBlock)
+`, domain, domain, root, fallback, phpBlock)
 	} else {
 		config = fmt.Sprintf(`<VirtualHost *:80>
     ServerName %s
+    ServerAlias www.%s
     DocumentRoot %s
     <Directory %s>
         Options FollowSymLinks
@@ -4191,7 +4199,7 @@ func createSite(domain, kind string) (site, error) {
         DirectoryIndex index.php index.html
     </Directory>
 %s</VirtualHost>
-`, domain, root, root, phpBlock)
+`, domain, domain, root, root, phpBlock)
 	}
 
 	if err := os.MkdirAll(root, 0755); err != nil {
