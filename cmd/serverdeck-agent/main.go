@@ -26,7 +26,7 @@ import (
 
 
 const (
-	version         = "0.24.6"
+	version         = "0.24.7"
 	protocolVersion = 1
 )
 
@@ -132,10 +132,16 @@ type phpVersionStatus struct {
 	Support    string   `json:"support"`
 }
 
+type mailAliasInfo struct {
+	Source      string `json:"source"`
+	Destination string `json:"destination"`
+}
+
 type mailDomainInfo struct {
-	Domain    string   `json:"domain"`
-	DKIMReady bool     `json:"dkim_ready"`
-	Accounts  []string `json:"accounts"`
+	Domain    string          `json:"domain"`
+	DKIMReady bool            `json:"dkim_ready"`
+	Accounts  []string        `json:"accounts"`
+	Aliases   []mailAliasInfo `json:"aliases"`
 }
 
 type mailStatus struct {
@@ -613,6 +619,33 @@ func main() {
 			break
 		}
 		err = deleteMailAccount(email)
+	case "mail-alias-create":
+		if len(os.Args) != 4 {
+			err = errors.New("mail-alias-create requires encoded source and destination")
+			break
+		}
+		source, srcErr := decodeArgument(os.Args[2])
+		dest, destErr := decodeArgument(os.Args[3])
+		if srcErr != nil {
+			err = srcErr
+			break
+		}
+		if destErr != nil {
+			err = destErr
+			break
+		}
+		err = createMailAlias(source, dest)
+	case "mail-alias-delete":
+		if len(os.Args) != 3 {
+			err = errors.New("mail-alias-delete requires an encoded source address")
+			break
+		}
+		source, decodeErr := decodeArgument(os.Args[2])
+		if decodeErr != nil {
+			err = decodeErr
+			break
+		}
+		err = deleteMailAlias(source)
 	case "file-list":
 		if len(os.Args) != 4 {
 			err = errors.New("file-list requires an encoded domain and path")
@@ -2156,6 +2189,7 @@ func listMailDomainsAndAccounts() []mailDomainInfo {
 					Domain:    domain,
 					DKIMReady: dkimReady,
 					Accounts:  []string{},
+					Aliases:   []mailAliasInfo{},
 				}
 			}
 		}
@@ -2182,9 +2216,44 @@ func listMailDomainsAndAccounts() []mailDomainInfo {
 		}
 	}
 
+	if virtualBytes, err := os.ReadFile("/etc/postfix/virtual"); err == nil {
+		lines := strings.Split(string(virtualBytes), "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			parts := strings.Fields(line)
+			if len(parts) >= 2 {
+				source := strings.ToLower(parts[0])
+				dest := strings.Join(parts[1:], " ")
+				var domain string
+				if strings.HasPrefix(source, "@") {
+					domain = source[1:]
+				} else {
+					idx := strings.Index(source, "@")
+					if idx > 0 && idx < len(source)-1 {
+						domain = source[idx+1:]
+					}
+				}
+				if domain != "" {
+					if info, exists := domainsMap[domain]; exists {
+						info.Aliases = append(info.Aliases, mailAliasInfo{
+							Source:      source,
+							Destination: dest,
+						})
+					}
+				}
+			}
+		}
+	}
+
 	domainsList := make([]mailDomainInfo, 0, len(domainsMap))
 	for _, info := range domainsMap {
 		sort.Strings(info.Accounts)
+		sort.Slice(info.Aliases, func(i, j int) bool {
+			return info.Aliases[i].Source < info.Aliases[j].Source
+		})
 		domainsList = append(domainsList, *info)
 	}
 
@@ -2823,20 +2892,22 @@ func configureMailFoundation() error {
 	_ = os.MkdirAll("/var/mail/vhosts", 0770)
 	_ = exec.Command("chown", "-R", "vmail:vmail", "/var/mail/vhosts").Run()
 
-	for _, file := range []string{"/etc/postfix/vhosts", "/etc/postfix/vmaps", "/etc/dovecot/users"} {
+	for _, file := range []string{"/etc/postfix/vhosts", "/etc/postfix/vmaps", "/etc/postfix/virtual", "/etc/dovecot/users"} {
 		if _, err := os.Stat(file); os.IsNotExist(err) {
 			_ = os.WriteFile(file, []byte(""), 0600)
 		}
 	}
-	_ = exec.Command("chown", "root:root", "/etc/postfix/vhosts", "/etc/postfix/vmaps").Run()
+	_ = exec.Command("chown", "root:root", "/etc/postfix/vhosts", "/etc/postfix/vmaps", "/etc/postfix/virtual").Run()
 	_ = os.Chmod("/etc/postfix/vhosts", 0600)
 	_ = os.Chmod("/etc/postfix/vmaps", 0600)
+	_ = os.Chmod("/etc/postfix/virtual", 0600)
 	_ = exec.Command("chown", "dovecot:dovecot", "/etc/dovecot/users").Run()
 	_ = os.Chmod("/etc/dovecot/users", 0600)
 
 	postfixSettings := []string{
 		"virtual_mailbox_domains = hash:/etc/postfix/vhosts",
 		"virtual_mailbox_maps = hash:/etc/postfix/vmaps",
+		"virtual_alias_maps = hash:/etc/postfix/virtual",
 		"virtual_transport = lmtp:unix:private/dovecot-lmtp",
 		"smtpd_sasl_type = dovecot",
 		"smtpd_sasl_path = private/auth",
@@ -2861,6 +2932,7 @@ func configureMailFoundation() error {
 
 	_ = exec.Command("postmap", "/etc/postfix/vhosts").Run()
 	_ = exec.Command("postmap", "/etc/postfix/vmaps").Run()
+	_ = exec.Command("postmap", "/etc/postfix/virtual").Run()
 	return nil
 }
 
@@ -6049,5 +6121,97 @@ func deleteMailAccount(email string) error {
 	_ = exec.Command("systemctl", "reload", "dovecot").Run()
 
 	_ = writeAudit("mail.account.deleted", true, email)
+	return nil
+}
+
+func createMailAlias(source, destination string) error {
+	if os.Geteuid() != 0 {
+		return errors.New("mail-alias-create must run as root")
+	}
+	source = strings.ToLower(strings.TrimSpace(source))
+	destination = strings.TrimSpace(destination)
+
+	var domain string
+	if strings.HasPrefix(source, "@") {
+		domain = source[1:]
+	} else {
+		idx := strings.Index(source, "@")
+		if idx <= 0 || idx >= len(source)-1 {
+			return errors.New("invalid source address format")
+		}
+		domain = source[idx+1:]
+	}
+
+	vhostsPath := "/etc/postfix/vhosts"
+	existingVhosts, err := os.ReadFile(vhostsPath)
+	if err != nil {
+		return errors.New("mail domain does not exist")
+	}
+	domainExists := false
+	for _, line := range strings.Split(string(existingVhosts), "\n") {
+		parts := strings.Fields(line)
+		if len(parts) > 0 && strings.ToLower(parts[0]) == domain {
+			domainExists = true
+			break
+		}
+	}
+	if !domainExists {
+		return errors.New("mail domain must be created in virtual domains first")
+	}
+
+	virtualPath := "/etc/postfix/virtual"
+	existingVirtual, err := os.ReadFile(virtualPath)
+	if err == nil {
+		for _, line := range strings.Split(string(existingVirtual), "\n") {
+			parts := strings.Fields(line)
+			if len(parts) > 0 && strings.ToLower(parts[0]) == source {
+				return errors.New("forwarding mapping already exists for this address")
+			}
+		}
+	}
+
+	newContent := string(existingVirtual)
+	if len(newContent) > 0 && !strings.HasSuffix(newContent, "\n") {
+		newContent += "\n"
+	}
+	newContent += fmt.Sprintf("%s %s\n", source, destination)
+	if err := atomicWrite(virtualPath, []byte(newContent), 0600); err != nil {
+		return err
+	}
+
+	_ = exec.Command("postmap", virtualPath).Run()
+	_ = exec.Command("systemctl", "reload", "postfix").Run()
+
+	_ = writeAudit("mail.alias.created", true, source+" -> "+destination)
+	return nil
+}
+
+func deleteMailAlias(source string) error {
+	if os.Geteuid() != 0 {
+		return errors.New("mail-alias-delete must run as root")
+	}
+	source = strings.ToLower(strings.TrimSpace(source))
+
+	virtualPath := "/etc/postfix/virtual"
+	if virtualBytes, err := os.ReadFile(virtualPath); err == nil {
+		lines := strings.Split(string(virtualBytes), "\n")
+		var newLines []string
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" {
+				continue
+			}
+			parts := strings.Fields(trimmed)
+			if len(parts) > 0 && strings.ToLower(parts[0]) == source {
+				continue
+			}
+			newLines = append(newLines, line)
+		}
+		_ = atomicWrite(virtualPath, []byte(strings.Join(newLines, "\n")+"\n"), 0600)
+		_ = exec.Command("postmap", virtualPath).Run()
+	}
+
+	_ = exec.Command("systemctl", "reload", "postfix").Run()
+	_ = writeAudit("mail.alias.deleted", true, source)
 	return nil
 }
