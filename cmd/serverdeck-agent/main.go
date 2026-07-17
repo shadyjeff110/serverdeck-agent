@@ -26,7 +26,7 @@ import (
 
 
 const (
-	version         = "0.24.4"
+	version         = "0.24.5"
 	protocolVersion = 1
 )
 
@@ -670,6 +670,43 @@ func main() {
 			break
 		}
 		data, err = switchPHP(string(decoded), os.Args[3])
+	case "site-delete":
+		if len(os.Args) != 4 {
+			err = errors.New("site-delete requires an encoded domain and delete-root flag")
+			break
+		}
+		decoded, decodeErr := decodeArgument(os.Args[2])
+		if decodeErr != nil {
+			err = decodeErr
+			break
+		}
+		deleteRoot, parseErr := strconv.ParseBool(os.Args[3])
+		if parseErr != nil {
+			err = parseErr
+			break
+		}
+		err = deleteSite(decoded, deleteRoot)
+	case "site-update":
+		if len(os.Args) != 5 {
+			err = errors.New("site-update requires an encoded domain, encoded new root, and encoded PHP version")
+			break
+		}
+		domain, domainErr := decodeArgument(os.Args[2])
+		if domainErr != nil {
+			err = domainErr
+			break
+		}
+		newRoot, rootErr := decodeArgument(os.Args[3])
+		if rootErr != nil {
+			err = rootErr
+			break
+		}
+		phpVersion, phpErr := decodeArgument(os.Args[4])
+		if phpErr != nil {
+			err = phpErr
+			break
+		}
+		err = updateSite(domain, newRoot, phpVersion)
 	case "node-install":
 		data, err = installNode()
 	case "project-create":
@@ -701,6 +738,17 @@ func main() {
 			break
 		}
 		data, err = createDatabase(string(databaseName), string(username))
+	case "database-delete":
+		if len(os.Args) != 3 {
+			err = errors.New("database-delete requires an encoded database name")
+			break
+		}
+		name, decodeErr := decodeArgument(os.Args[2])
+		if decodeErr != nil {
+			err = decodeErr
+			break
+		}
+		err = deleteDatabase(name)
 	case "tls-list":
 		data, err = listTLS()
 	case "tls-issue":
@@ -5289,6 +5337,23 @@ var allowedConfigs = map[string]string{
 }
 
 func getSoftwareConfigPath(id string) (string, error) {
+	if strings.HasPrefix(id, "site-") {
+		domain := strings.TrimPrefix(id, "site-")
+		metadataPath := filepath.Join("/var/lib/serverdeck/sites", domain+".json")
+		data, err := os.ReadFile(metadataPath)
+		if err != nil {
+			return "", fmt.Errorf("site not found: %w", err)
+		}
+		var value site
+		if err := json.Unmarshal(data, &value); err != nil {
+			return "", fmt.Errorf("read site metadata: %w", err)
+		}
+		path := filepath.Join("/etc/nginx/sites-available", domain)
+		if value.WebServer == "apache" {
+			path = filepath.Join("/etc/apache2/sites-available", domain+".conf")
+		}
+		return path, nil
+	}
 	if path, ok := allowedConfigs[id]; ok {
 		return path, nil
 	}
@@ -5414,4 +5479,154 @@ func writeSoftwareConfig(id, encodedContent string) (string, error) {
 
 	_ = writeAudit("software.config_updated", true, path)
 	return string(content), nil
+}
+
+func deleteSite(domain string, deleteRoot bool) error {
+	if os.Geteuid() != 0 {
+		return errors.New("site-delete must run as root")
+	}
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	
+	metadataPath := filepath.Join("/var/lib/serverdeck/sites", domain+".json")
+	data, err := os.ReadFile(metadataPath)
+	if err != nil {
+		return fmt.Errorf("site not found: %w", err)
+	}
+	var value site
+	if err := json.Unmarshal(data, &value); err != nil {
+		return fmt.Errorf("read site metadata: %w", err)
+	}
+
+	configPath := filepath.Join("/etc/nginx/sites-available", domain)
+	enabledPath := filepath.Join("/etc/nginx/sites-enabled", domain)
+	if value.WebServer == "apache" {
+		configPath = filepath.Join("/etc/apache2/sites-available", domain+".conf")
+		enabledPath = filepath.Join("/etc/apache2/sites-enabled", domain+".conf")
+	}
+
+	_ = os.Remove(enabledPath)
+	_ = os.Remove(configPath)
+	_ = os.Remove(metadataPath)
+
+	if deleteRoot {
+		parent := filepath.Dir(value.Root)
+		if strings.HasPrefix(parent, "/var/www/") && parent != "/var/www/" && parent != "/var/www" {
+			_ = os.RemoveAll(parent)
+		}
+	}
+
+	serviceName := "nginx"
+	if value.WebServer == "apache" {
+		serviceName = "apache2"
+	}
+	_ = exec.Command("systemctl", "reload", serviceName).Run()
+
+	_ = writeAudit("site.deleted", true, domain)
+	return nil
+}
+
+func updateSite(domain, newRoot, phpVersion string) error {
+	if os.Geteuid() != 0 {
+		return errors.New("site-update must run as root")
+	}
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	newRoot = strings.TrimSpace(newRoot)
+	
+	metadataPath := filepath.Join("/var/lib/serverdeck/sites", domain+".json")
+	data, err := os.ReadFile(metadataPath)
+	if err != nil {
+		return fmt.Errorf("site not found: %w", err)
+	}
+	var value site
+	if err := json.Unmarshal(data, &value); err != nil {
+		return fmt.Errorf("read site metadata: %w", err)
+	}
+
+	configPath := filepath.Join("/etc/nginx/sites-available", domain)
+	if value.WebServer == "apache" {
+		configPath = filepath.Join("/etc/apache2/sites-available", domain+".conf")
+	}
+
+	configBytes, err := os.ReadFile(configPath)
+	if err == nil {
+		configContent := string(configBytes)
+		configContent = strings.ReplaceAll(configContent, value.Root, newRoot)
+		
+		if phpVersion != "" && value.PHPVersion != phpVersion {
+			oldSocket := fmt.Sprintf("php%s-fpm.sock", value.PHPVersion)
+			newSocket := fmt.Sprintf("php%s-fpm.sock", phpVersion)
+			configContent = strings.ReplaceAll(configContent, oldSocket, newSocket)
+		}
+
+		if err := atomicWrite(configPath, []byte(configContent), 0644); err != nil {
+			return err
+		}
+
+		var testCmd *exec.Cmd
+		if value.WebServer == "nginx" {
+			testCmd = exec.Command("nginx", "-t")
+		} else {
+			testCmd = exec.Command("apache2ctl", "configtest")
+		}
+		if output, err := testCmd.CombinedOutput(); err != nil {
+			_ = atomicWrite(configPath, configBytes, 0644)
+			return fmt.Errorf("configuration validation failed: %s", tail(string(output), 800))
+		}
+	}
+
+	if err := os.MkdirAll(newRoot, 0755); err != nil {
+		return fmt.Errorf("create new document root: %w", err)
+	}
+
+	value.Root = newRoot
+	if phpVersion != "" {
+		value.PHPVersion = phpVersion
+	}
+	
+	metadata, _ := json.MarshalIndent(value, "", "  ")
+	if err := atomicWrite(metadataPath, append(metadata, '\n'), 0644); err != nil {
+		return err
+	}
+
+	serviceName := "nginx"
+	if value.WebServer == "apache" {
+		serviceName = "apache2"
+	}
+	_ = exec.Command("systemctl", "reload", serviceName).Run()
+
+	_ = writeAudit("site.updated", true, domain)
+	return nil
+}
+
+func deleteDatabase(name string) error {
+	if os.Geteuid() != 0 {
+		return errors.New("database-delete must run as root")
+	}
+	name = strings.ToLower(strings.TrimSpace(name))
+	
+	metadataPath := filepath.Join("/var/lib/serverdeck/databases", name+".json")
+	data, err := os.ReadFile(metadataPath)
+	if err != nil {
+		return fmt.Errorf("database not found: %w", err)
+	}
+	var value database
+	if err := json.Unmarshal(data, &value); err != nil {
+		return fmt.Errorf("read database metadata: %w", err)
+	}
+
+	if value.Engine == "PostgreSQL" {
+		_ = exec.Command("runuser", "-u", "postgres", "--", "dropdb", "--if-exists", name).Run()
+		_ = exec.Command("runuser", "-u", "postgres", "--", "dropuser", "--if-exists", value.Username).Run()
+	} else {
+		databaseClient := "mariadb"
+		if packageVersion("mysql-server") != "" && packageVersion("mariadb-server") == "" {
+			databaseClient = "mysql"
+		}
+		sql := fmt.Sprintf("DROP DATABASE IF EXISTS `%s`; DROP USER IF EXISTS '%s'@'localhost';", name, value.Username)
+		_ = exec.Command(databaseClient, "--execute", sql).Run()
+	}
+
+	_ = os.Remove(metadataPath)
+	_ = writeAudit("database.deleted", true, name)
+	return nil
 }
