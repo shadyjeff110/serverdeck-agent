@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	version         = "0.30.0"
+	version         = "0.31.0"
 	protocolVersion = 1
 )
 
@@ -911,6 +911,22 @@ func main() {
 			break
 		}
 		data, err = updateWordPressCore(domain)
+	case "wp-import":
+		if len(os.Args) != 4 {
+			err = errors.New("wp-import requires an encoded domain and session")
+			break
+		}
+		domain, domainErr := decodeArgument(os.Args[2])
+		session, sessionErr := decodeArgument(os.Args[3])
+		if domainErr != nil {
+			err = domainErr
+			break
+		}
+		if sessionErr != nil {
+			err = sessionErr
+			break
+		}
+		data, err = importWPress(domain, session)
 	case "php-version-list":
 		data, err = listPHPVersions()
 	case "php-version-install":
