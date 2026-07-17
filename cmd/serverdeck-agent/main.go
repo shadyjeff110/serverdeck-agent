@@ -13,14 +13,17 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
+
 
 const (
 	version         = "0.24.1"
@@ -169,6 +172,10 @@ type managedFile struct {
 	Directory bool   `json:"directory"`
 	Size      int64  `json:"size"`
 	Modified  string `json:"modified"`
+	Mode      string `json:"mode"`
+	Perm      string `json:"perm"`
+	Owner     string `json:"owner"`
+	Group     string `json:"group"`
 }
 
 type fileContents struct {
@@ -541,6 +548,30 @@ func main() {
 			break
 		}
 		data, err = deleteManagedFileEncoded(os.Args[2], os.Args[3])
+	case "file-create-dir":
+		if len(os.Args) != 4 {
+			err = errors.New("file-create-dir requires an encoded domain and path")
+			break
+		}
+		data, err = createManagedDirEncoded(os.Args[2], os.Args[3])
+	case "file-create-file":
+		if len(os.Args) != 4 {
+			err = errors.New("file-create-file requires an encoded domain and path")
+			break
+		}
+		data, err = createManagedFileEncoded(os.Args[2], os.Args[3])
+	case "file-chmod":
+		if len(os.Args) != 5 {
+			err = errors.New("file-chmod requires an encoded domain, path, and encoded mode")
+			break
+		}
+		data, err = chmodManagedFileEncoded(os.Args[2], os.Args[3], os.Args[4])
+	case "file-chown":
+		if len(os.Args) != 6 {
+			err = errors.New("file-chown requires an encoded domain, path, encoded owner, and encoded group")
+			break
+		}
+		data, err = chownManagedFileEncoded(os.Args[2], os.Args[3], os.Args[4], os.Args[5])
 	case "container-list":
 		data, err = inspectContainers()
 	case "container-install":
@@ -2111,6 +2142,31 @@ func managedSitePath(encodedDomain, encodedPath string) (string, string, error) 
 	return root, target, nil
 }
 
+func getFileMetadata(info os.FileInfo) (mode string, perm string, owner string, group string) {
+	mode = info.Mode().String()
+	perm = fmt.Sprintf("%04o", info.Mode().Perm())
+	owner = "unknown"
+	group = "unknown"
+
+	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+		uidStr := fmt.Sprintf("%d", stat.Uid)
+		gidStr := fmt.Sprintf("%d", stat.Gid)
+
+		if u, err := user.LookupId(uidStr); err == nil {
+			owner = u.Username
+		} else {
+			owner = uidStr
+		}
+
+		if g, err := user.LookupGroupId(gidStr); err == nil {
+			group = g.Name
+		} else {
+			group = gidStr
+		}
+	}
+	return
+}
+
 func listManagedFilesEncoded(domain, path string) ([]managedFile, error) {
 	root, target, err := managedSitePath(domain, path)
 	if err != nil {
@@ -2127,7 +2183,18 @@ func listManagedFilesEncoded(domain, path string) ([]managedFile, error) {
 			continue
 		}
 		relative, _ := filepath.Rel(root, filepath.Join(target, entry.Name()))
-		values = append(values, managedFile{Name: entry.Name(), Path: filepath.ToSlash(relative), Directory: entry.IsDir(), Size: info.Size(), Modified: info.ModTime().UTC().Format(time.RFC3339)})
+		m, p, o, g := getFileMetadata(info)
+		values = append(values, managedFile{
+			Name:      entry.Name(),
+			Path:      filepath.ToSlash(relative),
+			Directory: entry.IsDir(),
+			Size:      info.Size(),
+			Modified:  info.ModTime().UTC().Format(time.RFC3339),
+			Mode:      m,
+			Perm:      p,
+			Owner:     o,
+			Group:     g,
+		})
 	}
 	sort.Slice(values, func(i, j int) bool {
 		if values[i].Directory != values[j].Directory {
@@ -2214,6 +2281,156 @@ func deleteManagedFileEncoded(domain, path string) ([]managedFile, error) {
 	parent, _ := filepath.Rel(root, filepath.Dir(target))
 	return listManagedFilesEncoded(domain, base64.RawURLEncoding.EncodeToString([]byte(parent)))
 }
+
+func createManagedDirEncoded(domain, path string) ([]managedFile, error) {
+	if os.Geteuid() != 0 {
+		return nil, errors.New("file-create-dir must run as root")
+	}
+	root, target, err := managedSitePath(domain, path)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := os.Stat(target); err == nil {
+		return nil, errors.New("a file or folder with this name already exists")
+	}
+	if err := os.MkdirAll(target, 0755); err != nil {
+		return nil, err
+	}
+	parent := filepath.Dir(target)
+	if stat, err := os.Stat(parent); err == nil {
+		if sysStat, ok := stat.Sys().(*syscall.Stat_t); ok {
+			_ = os.Chown(target, int(sysStat.Uid), int(sysStat.Gid))
+		}
+	}
+	_ = writeAudit("file.create_dir", true, target)
+	
+	parentRel, _ := filepath.Rel(root, parent)
+	if parentRel == "." {
+		parentRel = ""
+	}
+	return listManagedFilesEncoded(domain, base64.RawURLEncoding.EncodeToString([]byte(parentRel)))
+}
+
+func createManagedFileEncoded(domain, path string) ([]managedFile, error) {
+	if os.Geteuid() != 0 {
+		return nil, errors.New("file-create-file must run as root")
+	}
+	root, target, err := managedSitePath(domain, path)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := os.Stat(target); err == nil {
+		return nil, errors.New("a file or folder with this name already exists")
+	}
+	if err := atomicWrite(target, []byte(""), 0644); err != nil {
+		return nil, err
+	}
+	parent := filepath.Dir(target)
+	if stat, err := os.Stat(parent); err == nil {
+		if sysStat, ok := stat.Sys().(*syscall.Stat_t); ok {
+			_ = os.Chown(target, int(sysStat.Uid), int(sysStat.Gid))
+		}
+	}
+	_ = writeAudit("file.create_file", true, target)
+
+	parentRel, _ := filepath.Rel(root, parent)
+	if parentRel == "." {
+		parentRel = ""
+	}
+	return listManagedFilesEncoded(domain, base64.RawURLEncoding.EncodeToString([]byte(parentRel)))
+}
+
+func chmodManagedFileEncoded(domain, path, encodedMode string) ([]managedFile, error) {
+	if os.Geteuid() != 0 {
+		return nil, errors.New("file-chmod must run as root")
+	}
+	modeStr, err := decodeArgument(encodedMode)
+	if err != nil {
+		return nil, err
+	}
+	modeVal, err := strconv.ParseUint(modeStr, 8, 32)
+	if err != nil {
+		return nil, errors.New("invalid permission mode (must be octal e.g. 0644)")
+	}
+	root, target, err := managedSitePath(domain, path)
+	if err != nil {
+		return nil, err
+	}
+	if target == root {
+		return nil, errors.New("the website root permissions cannot be modified")
+	}
+	if err := os.Chmod(target, os.FileMode(modeVal)); err != nil {
+		return nil, err
+	}
+	_ = writeAudit("file.chmod", true, target)
+
+	parent := filepath.Dir(target)
+	parentRel, _ := filepath.Rel(root, parent)
+	if parentRel == "." {
+		parentRel = ""
+	}
+	return listManagedFilesEncoded(domain, base64.RawURLEncoding.EncodeToString([]byte(parentRel)))
+}
+
+func chownManagedFileEncoded(domain, path, encodedOwner, encodedGroup string) ([]managedFile, error) {
+	if os.Geteuid() != 0 {
+		return nil, errors.New("file-chown must run as root")
+	}
+	ownerStr, err := decodeArgument(encodedOwner)
+	if err != nil {
+		return nil, err
+	}
+	groupStr, err := decodeArgument(encodedGroup)
+	if err != nil {
+		return nil, err
+	}
+	root, target, err := managedSitePath(domain, path)
+	if err != nil {
+		return nil, err
+	}
+	if target == root {
+		return nil, errors.New("the website root ownership cannot be modified")
+	}
+
+	uid := -1
+	if ownerStr != "" {
+		if u, err := user.Lookup(ownerStr); err == nil {
+			if parsedUid, err := strconv.Atoi(u.Uid); err == nil {
+				uid = parsedUid
+			}
+		} else if parsedUid, err := strconv.Atoi(ownerStr); err == nil {
+			uid = parsedUid
+		} else {
+			return nil, fmt.Errorf("user not found: %s", ownerStr)
+		}
+	}
+
+	gid := -1
+	if groupStr != "" {
+		if g, err := user.LookupGroup(groupStr); err == nil {
+			if parsedGid, err := strconv.Atoi(g.Gid); err == nil {
+				gid = parsedGid
+			}
+		} else if parsedGid, err := strconv.Atoi(groupStr); err == nil {
+			gid = parsedGid
+		} else {
+			return nil, fmt.Errorf("group not found: %s", groupStr)
+		}
+	}
+
+	if err := os.Chown(target, uid, gid); err != nil {
+		return nil, err
+	}
+	_ = writeAudit("file.chown", true, target)
+
+	parent := filepath.Dir(target)
+	parentRel, _ := filepath.Rel(root, parent)
+	if parentRel == "." {
+		parentRel = ""
+	}
+	return listManagedFilesEncoded(domain, base64.RawURLEncoding.EncodeToString([]byte(parentRel)))
+}
+
 
 func installMailStack() (mailStatus, error) {
 	if os.Geteuid() != 0 {
