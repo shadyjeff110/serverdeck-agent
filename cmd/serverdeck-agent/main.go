@@ -29,7 +29,7 @@ import (
 )
 
 const (
-	version         = "0.26.0"
+	version         = "0.27.0"
 	protocolVersion = 1
 )
 
@@ -844,7 +844,7 @@ func main() {
 	case "tls-list":
 		data, err = listTLS()
 	case "tls-issue":
-		if len(os.Args) != 4 {
+		if len(os.Args) != 4 && len(os.Args) != 5 {
 			err = errors.New("tls-issue requires encoded domain and email")
 			break
 		}
@@ -858,7 +858,7 @@ func main() {
 			err = emailErr
 			break
 		}
-		data, err = issueTLS(string(domain), string(email))
+		data, err = issueTLS(string(domain), string(email), len(os.Args) == 5 && os.Args[4] == "force")
 	case "tls-detail":
 		if len(os.Args) != 3 {
 			err = errors.New("tls-detail requires an encoded domain")
@@ -882,7 +882,7 @@ func main() {
 		}
 		data, err = removeTLS(domain)
 	case "tls-dns-issue":
-		if len(os.Args) != 5 {
+		if len(os.Args) != 5 && len(os.Args) != 6 {
 			err = errors.New("tls-dns-issue requires an encoded domain, encoded email, and session")
 			break
 		}
@@ -896,7 +896,7 @@ func main() {
 			err = emailErr
 			break
 		}
-		data, err = issueTLSDNS(string(domain), string(email), os.Args[4])
+		data, err = issueTLSDNS(string(domain), string(email), os.Args[4], len(os.Args) == 6 && os.Args[5] == "force")
 	case "tls-dns-auth":
 		if len(os.Args) != 3 {
 			err = errors.New("tls-dns-auth requires a session")
@@ -1811,13 +1811,18 @@ func localIPs() []string {
 	return values
 }
 
-func issueTLS(domain, email string) (tlsStatus, error) {
+func issueTLS(domain, email string, force bool) (tlsStatus, error) {
 	if os.Geteuid() != 0 {
 		return tlsStatus{}, errors.New("tls-issue must run as root")
 	}
 	domain, email = strings.ToLower(strings.TrimSpace(domain)), strings.TrimSpace(email)
-	if !domainPattern.MatchString(domain) || !regexp.MustCompile(`^[^@\s]+@[^@\s]+\.[^@\s]+$`).MatchString(email) {
-		return tlsStatus{}, errors.New("invalid domain or email address")
+	if !domainPattern.MatchString(domain) {
+		return tlsStatus{}, errors.New("invalid domain")
+	}
+	// Email is only required for the very first issuance (account registration).
+	// A renewal (force) reuses the existing ACME account, so it may be omitted.
+	if email != "" && !regexp.MustCompile(`^[^@\s]+@[^@\s]+\.[^@\s]+$`).MatchString(email) {
+		return tlsStatus{}, errors.New("invalid email address")
 	}
 	metadataPath := filepath.Join("/var/lib/serverdeck/sites", domain+".json")
 	metadata, err := os.ReadFile(metadataPath)
@@ -1844,18 +1849,35 @@ func issueTLS(domain, email string) (tlsStatus, error) {
 	if err != nil {
 		return readiness, err
 	}
-	_ = writeAudit("tls.issue.started", true, domain)
-	arguments := []string{"certonly", "--nginx", "--non-interactive", "--agree-tos", "--keep-until-expiring", "--email", email, "--domain", domain, "--domain", "www." + domain}
-	if webServer == "apache" {
-		arguments = []string{"--apache", "--non-interactive", "--agree-tos", "--keep-until-expiring", "--redirect", "--email", email, "--domain", domain, "--domain", "www." + domain}
+	// --force-renewal and --keep-until-expiring are mutually exclusive.
+	renewalFlag := "--keep-until-expiring"
+	if force {
+		renewalFlag = "--force-renewal"
 	}
-	if output, err := exec.Command("certbot", arguments...).CombinedOutput(); err != nil {
-		// Fallback: try issuing only for the apex domain in case www is not pointed
-		fallbackArgs := []string{"certonly", "--nginx", "--non-interactive", "--agree-tos", "--keep-until-expiring", "--email", email, "--domain", domain}
+	buildArgs := func(withWWW bool) []string {
+		var args []string
 		if webServer == "apache" {
-			fallbackArgs = []string{"--apache", "--non-interactive", "--agree-tos", "--keep-until-expiring", "--redirect", "--email", email, "--domain", domain}
+			args = []string{"--apache", "--non-interactive", "--agree-tos", renewalFlag, "--redirect"}
+		} else {
+			args = []string{"certonly", "--nginx", "--non-interactive", "--agree-tos", renewalFlag}
 		}
-		if fallbackOutput, fallbackErr := exec.Command("certbot", fallbackArgs...).CombinedOutput(); fallbackErr != nil {
+		if email != "" {
+			args = append(args, "--email", email)
+		}
+		args = append(args, "--domain", domain)
+		if withWWW {
+			args = append(args, "--domain", "www."+domain)
+		}
+		return args
+	}
+	if force {
+		_ = writeAudit("tls.renew.started", true, domain)
+	} else {
+		_ = writeAudit("tls.issue.started", true, domain)
+	}
+	if output, err := exec.Command("certbot", buildArgs(true)...).CombinedOutput(); err != nil {
+		// Fallback: try issuing only for the apex domain in case www is not pointed
+		if fallbackOutput, fallbackErr := exec.Command("certbot", buildArgs(false)...).CombinedOutput(); fallbackErr != nil {
 			_ = atomicWrite(configPath, original, 0644)
 			_ = exec.Command("systemctl", "reload", map[string]string{"nginx": "nginx", "apache": "apache2"}[webServer]).Run()
 			_ = writeAudit("tls.issue.failed", false, domain+": "+tail(string(output)+"\nFallback: "+string(fallbackOutput), 800))
@@ -2163,13 +2185,17 @@ func continueDNSChallenge(session string, abort bool) (map[string]bool, error) {
 	return map[string]bool{name: true}, nil
 }
 
-func issueTLSDNS(domain, email, session string) (tlsStatus, error) {
+func issueTLSDNS(domain, email, session string, force bool) (tlsStatus, error) {
 	if os.Geteuid() != 0 {
 		return tlsStatus{}, errors.New("tls-dns-issue must run as root")
 	}
 	domain, email = strings.ToLower(strings.TrimSpace(domain)), strings.TrimSpace(email)
-	if !domainPattern.MatchString(domain) || !regexp.MustCompile(`^[^@\s]+@[^@\s]+\.[^@\s]+$`).MatchString(email) {
-		return tlsStatus{}, errors.New("invalid domain or email address")
+	if !domainPattern.MatchString(domain) {
+		return tlsStatus{}, errors.New("invalid domain")
+	}
+	// Email is only required for first issuance; a renewal reuses the account.
+	if email != "" && !regexp.MustCompile(`^[^@\s]+@[^@\s]+\.[^@\s]+$`).MatchString(email) {
+		return tlsStatus{}, errors.New("invalid email address")
 	}
 	directory, err := dnsSessionDirectory(session)
 	if err != nil {
@@ -2206,7 +2232,14 @@ func issueTLSDNS(domain, email, session string) (tlsStatus, error) {
 	// report "Unable to find manual-auth-hook command ... in the PATH".
 	authHook := fmt.Sprintf("%s tls-dns-auth %s", hookBinary, session)
 	cleanupHook := fmt.Sprintf("%s tls-dns-cleanup %s", hookBinary, session)
-	arguments := []string{"certonly", "--manual", "--preferred-challenges", "dns", "--manual-auth-hook", authHook, "--manual-cleanup-hook", cleanupHook, "--non-interactive", "--agree-tos", "--keep-until-expiring", "--email", email, "--domain", domain}
+	renewalFlag := "--keep-until-expiring"
+	if force {
+		renewalFlag = "--force-renewal"
+	}
+	arguments := []string{"certonly", "--manual", "--preferred-challenges", "dns", "--manual-auth-hook", authHook, "--manual-cleanup-hook", cleanupHook, "--non-interactive", "--agree-tos", renewalFlag, "--domain", domain}
+	if email != "" {
+		arguments = append(arguments, "--email", email)
+	}
 	if certbotMajorVersion() < 2 {
 		// Required by certbot < 2.0 for non-interactive manual mode; the
 		// flag was removed in certbot 2.0 and would be rejected there.
