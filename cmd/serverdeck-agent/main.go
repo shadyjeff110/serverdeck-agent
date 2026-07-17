@@ -24,12 +24,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
 
 const (
-	version         = "0.27.0"
+	version         = "0.28.0"
 	protocolVersion = 1
 )
 
@@ -1733,34 +1734,61 @@ func fileSHA256(path string) (string, error) {
 	return fmt.Sprintf("%x", hash.Sum(nil)), nil
 }
 
-func listTLS() ([]tlsStatus, error) {
-	sites, err := listSites()
-	if err != nil {
-		return nil, err
-	}
-	statuses := make([]tlsStatus, 0, len(sites))
-	for _, value := range sites {
-		statuses = append(statuses, inspectTLS(value.Domain))
-	}
-	return statuses, nil
-}
-
-func inspectTLS(domain string) tlsStatus {
-	status := tlsStatus{Domain: domain, DNSAddresses: []string{}, ServerIPs: localIPs()}
+// detectServerIPs returns the local interface addresses plus the detected
+// public address. detectPublicAddress makes an external HTTP call, so callers
+// that inspect many domains should compute this once and reuse it rather than
+// paying the round-trip per domain.
+func detectServerIPs() []string {
+	ips := localIPs()
 	if detected, err := detectPublicAddress(); err == nil {
 		if publicIP := detected["address"]; publicIP != "" {
 			alreadyPresent := false
-			for _, address := range status.ServerIPs {
+			for _, address := range ips {
 				if address == publicIP {
 					alreadyPresent = true
 				}
 			}
 			if !alreadyPresent {
-				status.ServerIPs = append(status.ServerIPs, publicIP)
-				sort.Strings(status.ServerIPs)
+				ips = append(ips, publicIP)
+				sort.Strings(ips)
 			}
 		}
 	}
+	return ips
+}
+
+func listTLS() ([]tlsStatus, error) {
+	sites, err := listSites()
+	if err != nil {
+		return nil, err
+	}
+	// Detect the public address once (one external call) and resolve every
+	// domain concurrently, instead of one blocking round-trip per site.
+	serverIPs := detectServerIPs()
+	statuses := make([]tlsStatus, len(sites))
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, 8)
+	for index, value := range sites {
+		wg.Add(1)
+		go func(index int, domain string) {
+			defer wg.Done()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+			statuses[index] = inspectTLSWithServerIPs(domain, serverIPs)
+		}(index, value.Domain)
+	}
+	wg.Wait()
+	return statuses, nil
+}
+
+func inspectTLS(domain string) tlsStatus {
+	return inspectTLSWithServerIPs(domain, detectServerIPs())
+}
+
+func inspectTLSWithServerIPs(domain string, serverIPs []string) tlsStatus {
+	// Copy so concurrent callers never share a backing array.
+	ips := append([]string(nil), serverIPs...)
+	status := tlsStatus{Domain: domain, DNSAddresses: []string{}, ServerIPs: ips}
 	addresses, _ := net.LookupHost(domain)
 	seen := map[string]bool{}
 	for _, address := range addresses {
