@@ -26,7 +26,7 @@ import (
 
 
 const (
-	version         = "0.24.3"
+	version         = "0.24.4"
 	protocolVersion = 1
 )
 
@@ -43,6 +43,10 @@ type service struct {
 	Installed   bool   `json:"installed"`
 	Active      bool   `json:"active"`
 	Description string `json:"description"`
+	SubState    string `json:"sub_state,omitempty"`
+	PID         int    `json:"pid,omitempty"`
+	Memory      int64  `json:"memory,omitempty"`
+	Uptime      string `json:"uptime,omitempty"`
 }
 
 type site struct {
@@ -429,6 +433,28 @@ func main() {
 		data, err = listRuntimes()
 	case "software-list":
 		data, err = listSoftware()
+	case "software-config-read":
+		if len(os.Args) != 3 {
+			err = errors.New("software-config-read requires an encoded configuration ID")
+			break
+		}
+		configID, decodeErr := decodeArgument(os.Args[2])
+		if decodeErr != nil {
+			err = decodeErr
+			break
+		}
+		data, err = readSoftwareConfig(configID)
+	case "software-config-write":
+		if len(os.Args) != 4 {
+			err = errors.New("software-config-write requires an encoded configuration ID and encoded content")
+			break
+		}
+		configID, decodeErr := decodeArgument(os.Args[2])
+		if decodeErr != nil {
+			err = decodeErr
+			break
+		}
+		data, err = writeSoftwareConfig(configID, os.Args[3])
 	case "source-list":
 		data, err = listPackageSources()
 	case "source-catalog":
@@ -5152,18 +5178,23 @@ func inspectServices() ([]service, error) {
 
 	services := make([]service, 0, len(names))
 	for _, name := range names {
-		loadState := systemctl("show", name+".service", "--property=LoadState", "--value")
-		activeState := systemctl("is-active", name+".service")
-		active := strings.TrimSpace(activeState) == "active"
+		loadState, subState, activeEnter, pid, memory := getServiceSystemdProperties(name)
+		active := strings.TrimSpace(systemctl("is-active", name+".service")) == "active"
 		if name == "ufw" {
 			active = firewallIsActive()
 		}
-		services = append(services, service{
-			Name:        name,
-			Installed:   strings.TrimSpace(loadState) == "loaded",
-			Active:      active,
-			Description: managedServices[name],
-		})
+		var s service
+		s.Name = name
+		s.Installed = strings.TrimSpace(loadState) == "loaded"
+		s.Active = active
+		s.Description = managedServices[name]
+		if active {
+			s.SubState = subState
+			s.PID = pid
+			s.Memory = memory
+			s.Uptime = activeEnter
+		}
+		services = append(services, s)
 	}
 	phpUnits, _ := exec.Command("systemctl", "list-unit-files", "php*-fpm.service", "--no-legend", "--no-pager").Output()
 	for _, line := range strings.Split(string(phpUnits), "\n") {
@@ -5172,25 +5203,215 @@ func inspectServices() ([]service, error) {
 			continue
 		}
 		name := strings.TrimSuffix(fields[0], ".service")
-		services = append(services, service{
-			Name:        name,
-			Installed:   true,
-			Active:      strings.TrimSpace(systemctl("is-active", fields[0])) == "active",
-			Description: "PHP application runtime",
-		})
+		_, subState, activeEnter, pid, memory := getServiceSystemdProperties(name)
+		active := strings.TrimSpace(systemctl("is-active", fields[0])) == "active"
+		var s service
+		s.Name = name
+		s.Installed = true
+		s.Active = active
+		s.Description = "PHP application runtime"
+		if active {
+			s.SubState = subState
+			s.PID = pid
+			s.Memory = memory
+			s.Uptime = activeEnter
+		}
+		services = append(services, s)
 	}
 	sites, _ := listSites()
 	for _, site := range sites {
 		if site.Service == "" {
 			continue
 		}
-		services = append(services, service{Name: site.Service, Installed: true, Active: strings.TrimSpace(systemctl("is-active", site.Service+".service")) == "active", Description: "Node.js project for " + site.Domain})
+		_, subState, activeEnter, pid, memory := getServiceSystemdProperties(site.Service)
+		active := strings.TrimSpace(systemctl("is-active", site.Service+".service")) == "active"
+		var s service
+		s.Name = site.Service
+		s.Installed = true
+		s.Active = active
+		s.Description = "Node.js project for " + site.Domain
+		if active {
+			s.SubState = subState
+			s.PID = pid
+			s.Memory = memory
+			s.Uptime = activeEnter
+		}
+		services = append(services, s)
 	}
 	sort.Slice(services, func(i, j int) bool { return services[i].Name < services[j].Name })
 	return services, nil
 }
 
+func getServiceSystemdProperties(name string) (loadState, subState, activeEnter string, pid int, memory int64) {
+	output := systemctl("show", name+".service", "--property=LoadState,SubState,ActiveEnterTimestamp,MainPID,MemoryCurrent")
+	lines := strings.Split(output, "\n")
+	for _, line := range lines {
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(parts[0])
+		val := strings.TrimSpace(parts[1])
+		switch key {
+		case "LoadState":
+			loadState = val
+		case "SubState":
+			subState = val
+		case "ActiveEnterTimestamp":
+			if val != "[not set]" && val != "" {
+				activeEnter = val
+			}
+		case "MainPID":
+			if p, err := strconv.Atoi(val); err == nil {
+				pid = p
+			}
+		case "MemoryCurrent":
+			if val != "[not set]" && val != "" {
+				if m, err := strconv.ParseInt(val, 10, 64); err == nil {
+					memory = m
+				}
+			}
+		}
+	}
+	return
+}
+
 func systemctl(arguments ...string) string {
 	output, _ := exec.Command("systemctl", arguments...).Output()
 	return string(output)
+}
+
+var allowedConfigs = map[string]string{
+	"nginx":    "/etc/nginx/nginx.conf",
+	"apache":   "/etc/apache2/apache2.conf",
+	"redis":    "/etc/redis/redis.conf",
+	"fail2ban": "/etc/fail2ban/jail.conf",
+}
+
+func getSoftwareConfigPath(id string) (string, error) {
+	if path, ok := allowedConfigs[id]; ok {
+		return path, nil
+	}
+	if id == "mysql" || id == "mariadb" {
+		for _, path := range []string{
+			"/etc/mysql/mariadb.conf.d/50-server.cnf",
+			"/etc/mysql/mysql.conf.d/mysqld.cnf",
+			"/etc/mysql/my.cnf",
+		} {
+			if _, err := os.Stat(path); err == nil {
+				return path, nil
+			}
+		}
+		return "", errors.New("database configuration file not found")
+	}
+	if id == "postgresql" {
+		matches, _ := filepath.Glob("/etc/postgresql/*/main/postgresql.conf")
+		if len(matches) > 0 {
+			return matches[0], nil
+		}
+		return "", errors.New("postgresql configuration file not found")
+	}
+	if strings.HasPrefix(id, "php") {
+		ver := strings.TrimPrefix(id, "php")
+		if len(ver) > 1 && !strings.Contains(ver, ".") {
+			ver = string(ver[0]) + "." + ver[1:]
+		}
+		path := fmt.Sprintf("/etc/php/%s/fpm/php.ini", ver)
+		if _, err := os.Stat(path); err == nil {
+			return path, nil
+		}
+		return "", fmt.Errorf("php configuration not found for version %s", ver)
+	}
+	return "", fmt.Errorf("unsupported configuration identifier: %s", id)
+}
+
+func readSoftwareConfig(id string) (string, error) {
+	path, err := getSoftwareConfigPath(id)
+	if err != nil {
+		return "", err
+	}
+	bytes, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return string(bytes), nil
+}
+
+func writeSoftwareConfig(id, encodedContent string) (string, error) {
+	if os.Geteuid() != 0 {
+		return "", errors.New("software-config-write must run as root")
+	}
+	path, err := getSoftwareConfigPath(id)
+	if err != nil {
+		return "", err
+	}
+	content, err := base64.RawURLEncoding.DecodeString(encodedContent)
+	if err != nil {
+		content, err = base64.StdEncoding.DecodeString(encodedContent)
+		if err != nil {
+			return "", errors.New("invalid encoded content")
+		}
+	}
+	
+	backupPath := path + ".bak"
+	if originalBytes, err := os.ReadFile(path); err == nil {
+		_ = os.WriteFile(backupPath, originalBytes, 0644)
+	}
+
+	if err := atomicWrite(path, content, 0644); err != nil {
+		return "", err
+	}
+
+	var testCmd *exec.Cmd
+	if id == "nginx" {
+		testCmd = exec.Command("nginx", "-t")
+	} else if id == "apache" {
+		testCmd = exec.Command("apache2ctl", "configtest")
+	}
+
+	if testCmd != nil {
+		if output, err := testCmd.CombinedOutput(); err != nil {
+			if backupBytes, backupErr := os.ReadFile(backupPath); backupErr == nil {
+				_ = os.WriteFile(path, backupBytes, 0644)
+			}
+			outStr := string(output)
+			if len(outStr) > 800 {
+				outStr = outStr[len(outStr)-800:]
+			}
+			return "", fmt.Errorf("configuration validation failed: %s", outStr)
+		}
+	}
+
+	var serviceName string
+	switch {
+	case id == "nginx":
+		serviceName = "nginx"
+	case id == "apache":
+		serviceName = "apache2"
+	case id == "mysql" || id == "mariadb":
+		if packageVersion("mariadb-server") != "" {
+			serviceName = "mariadb"
+		} else {
+			serviceName = "mysql"
+		}
+	case id == "postgresql":
+		serviceName = "postgresql"
+	case id == "redis":
+		serviceName = "redis-server"
+	case id == "fail2ban":
+		serviceName = "fail2ban"
+	case strings.HasPrefix(id, "php"):
+		ver := strings.TrimPrefix(id, "php")
+		if len(ver) > 1 && !strings.Contains(ver, ".") {
+			ver = string(ver[0]) + "." + ver[1:]
+		}
+		serviceName = "php" + ver + "-fpm"
+	}
+
+	if serviceName != "" {
+		_ = exec.Command("systemctl", "restart", serviceName).Run()
+	}
+
+	_ = writeAudit("software.config_updated", true, path)
+	return string(content), nil
 }
