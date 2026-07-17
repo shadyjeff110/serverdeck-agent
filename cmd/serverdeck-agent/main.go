@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	version         = "0.24.0"
+	version         = "0.24.1"
 	protocolVersion = 1
 )
 
@@ -1661,6 +1661,25 @@ type dnsChallenge struct {
 
 var dnsSessionPattern = regexp.MustCompile(`^[a-f0-9]{32}$`)
 
+// certbotMajorVersion parses `certbot --version` ("certbot 0.40.0"). It
+// returns 2 when detection fails so modern flag behavior is the default.
+func certbotMajorVersion() int {
+	output, err := exec.Command("certbot", "--version").CombinedOutput()
+	if err != nil {
+		return 2
+	}
+	fields := strings.Fields(strings.TrimSpace(string(output)))
+	if len(fields) == 0 {
+		return 2
+	}
+	parts := strings.SplitN(fields[len(fields)-1], ".", 2)
+	major, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 2
+	}
+	return major
+}
+
 func dnsSessionDirectory(session string) (string, error) {
 	if !dnsSessionPattern.MatchString(session) {
 		return "", errors.New("invalid DNS validation session")
@@ -1756,12 +1775,20 @@ func issueTLSDNS(domain, email, session string) (tlsStatus, error) {
 	}
 	defer os.RemoveAll(directory)
 	hookBinary := "/usr/local/bin/serverdeck-agent"
-	if executable, executableErr := os.Executable(); executableErr == nil {
+	if executable, executableErr := os.Executable(); executableErr == nil && !strings.ContainsAny(executable, " \t\"'\\") {
 		hookBinary = executable
 	}
-	authHook := fmt.Sprintf("%s tls-dns-auth %s", strconv.Quote(hookBinary), session)
-	cleanupHook := fmt.Sprintf("%s tls-dns-cleanup %s", strconv.Quote(hookBinary), session)
+	// The hook path must not be quoted: certbot 0.40 (Ubuntu 20.04) validates
+	// the first whitespace-separated token literally, so quotes make it
+	// report "Unable to find manual-auth-hook command ... in the PATH".
+	authHook := fmt.Sprintf("%s tls-dns-auth %s", hookBinary, session)
+	cleanupHook := fmt.Sprintf("%s tls-dns-cleanup %s", hookBinary, session)
 	arguments := []string{"certonly", "--manual", "--preferred-challenges", "dns", "--manual-auth-hook", authHook, "--manual-cleanup-hook", cleanupHook, "--non-interactive", "--agree-tos", "--keep-until-expiring", "--email", email, "--domain", domain}
+	if certbotMajorVersion() < 2 {
+		// Required by certbot < 2.0 for non-interactive manual mode; the
+		// flag was removed in certbot 2.0 and would be rejected there.
+		arguments = append(arguments, "--manual-public-ip-logging-ok")
+	}
 	command := exec.Command("certbot", arguments...)
 	var output bytes.Buffer
 	command.Stdout = &output
