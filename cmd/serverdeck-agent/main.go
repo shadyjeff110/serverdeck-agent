@@ -2,10 +2,14 @@ package main
 
 import (
 	"bytes"
+	"crypto/ecdsa"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -24,9 +28,8 @@ import (
 	"time"
 )
 
-
 const (
-	version         = "0.24.8"
+	version         = "0.26.0"
 	protocolVersion = 1
 )
 
@@ -856,6 +859,28 @@ func main() {
 			break
 		}
 		data, err = issueTLS(string(domain), string(email))
+	case "tls-detail":
+		if len(os.Args) != 3 {
+			err = errors.New("tls-detail requires an encoded domain")
+			break
+		}
+		domain, decodeErr := decodeArgument(os.Args[2])
+		if decodeErr != nil {
+			err = decodeErr
+			break
+		}
+		data, err = detailTLS(domain)
+	case "tls-remove":
+		if len(os.Args) != 3 {
+			err = errors.New("tls-remove requires an encoded domain")
+			break
+		}
+		domain, decodeErr := decodeArgument(os.Args[2])
+		if decodeErr != nil {
+			err = decodeErr
+			break
+		}
+		data, err = removeTLS(domain)
 	case "tls-dns-issue":
 		if len(os.Args) != 5 {
 			err = errors.New("tls-dns-issue requires an encoded domain, encoded email, and session")
@@ -1880,6 +1905,178 @@ func configureNginxTLS(domain, configPath string, original []byte) error {
 	return nil
 }
 
+type certificateDetail struct {
+	Domain        string   `json:"domain"`
+	Subject       string   `json:"subject"`
+	Issuer        string   `json:"issuer"`
+	Domains       []string `json:"domains"`
+	NotBefore     string   `json:"notBefore"`
+	NotAfter      string   `json:"notAfter"`
+	DaysRemaining int      `json:"daysRemaining"`
+	Serial        string   `json:"serial"`
+	KeyType       string   `json:"keyType"`
+	Fingerprint   string   `json:"fingerprint"`
+}
+
+func detailTLS(domain string) (certificateDetail, error) {
+	detail := certificateDetail{}
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	if !domainPattern.MatchString(domain) {
+		return detail, errors.New("invalid domain")
+	}
+	if _, err := os.Stat(filepath.Join("/var/lib/serverdeck/sites", domain+".json")); err != nil {
+		return detail, errors.New("managed website was not found")
+	}
+	contents, err := os.ReadFile(filepath.Join("/etc/letsencrypt/live", domain, "cert.pem"))
+	if err != nil {
+		return detail, errors.New("no certificate is installed for this domain")
+	}
+	block, _ := pem.Decode(contents)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return detail, errors.New("the certificate file could not be parsed")
+	}
+	certificate, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return detail, err
+	}
+	detail.Domain = domain
+	detail.Subject = certificate.Subject.CommonName
+	detail.Issuer = strings.TrimSpace(strings.Join(append(certificate.Issuer.Organization, certificate.Issuer.CommonName), " "))
+	detail.Domains = append([]string{}, certificate.DNSNames...)
+	sort.Strings(detail.Domains)
+	detail.NotBefore = certificate.NotBefore.UTC().Format(time.RFC1123)
+	detail.NotAfter = certificate.NotAfter.UTC().Format(time.RFC1123)
+	detail.DaysRemaining = int(time.Until(certificate.NotAfter).Hours() / 24)
+	detail.Serial = certificate.SerialNumber.Text(16)
+	switch key := certificate.PublicKey.(type) {
+	case *rsa.PublicKey:
+		detail.KeyType = fmt.Sprintf("RSA %d-bit", key.N.BitLen())
+	case *ecdsa.PublicKey:
+		detail.KeyType = fmt.Sprintf("ECDSA %s", key.Curve.Params().Name)
+	default:
+		detail.KeyType = certificate.PublicKeyAlgorithm.String()
+	}
+	fingerprint := sha256.Sum256(certificate.Raw)
+	detail.Fingerprint = fmt.Sprintf("%x", fingerprint)
+	return detail, nil
+}
+
+// stripNginxTLS removes the HTTPS directives that configureNginxTLS inserted,
+// returning an HTTP-only configuration.
+func stripNginxTLS(config string) string {
+	lines := strings.Split(config, "\n")
+	kept := make([]string, 0, len(lines))
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "listen 443") || strings.HasPrefix(trimmed, "listen [::]:443") || strings.HasPrefix(trimmed, "ssl_certificate") {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return strings.Join(kept, "\n")
+}
+
+// stripApacheCertbotRedirect removes the HTTP-to-HTTPS redirect directives the
+// certbot Apache installer adds to the port-80 virtual host. ServerDeck
+// generates these site configurations, so the only rewrite rules present are
+// the certbot-inserted redirect trio.
+func stripApacheCertbotRedirect(config string) string {
+	lines := strings.Split(config, "\n")
+	kept := make([]string, 0, len(lines))
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "RewriteEngine on" || strings.HasPrefix(trimmed, "RewriteCond %{SERVER_NAME}") || strings.HasPrefix(trimmed, "RewriteRule ^ https://%{SERVER_NAME}%{REQUEST_URI}") {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return strings.Join(kept, "\n")
+}
+
+func removeTLS(domain string) (tlsStatus, error) {
+	if os.Geteuid() != 0 {
+		return tlsStatus{}, errors.New("tls-remove must run as root")
+	}
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	if !domainPattern.MatchString(domain) {
+		return tlsStatus{}, errors.New("invalid domain")
+	}
+	metadataPath := filepath.Join("/var/lib/serverdeck/sites", domain+".json")
+	metadata, err := os.ReadFile(metadataPath)
+	if err != nil {
+		return tlsStatus{}, errors.New("managed website was not found")
+	}
+	var managedSite site
+	if err := json.Unmarshal(metadata, &managedSite); err != nil {
+		return tlsStatus{}, err
+	}
+	status := inspectTLS(domain)
+	if !status.Certificate {
+		return status, errors.New("no certificate is installed for this domain")
+	}
+	webServer := managedSite.WebServer
+	if webServer == "" {
+		webServer = "nginx"
+	}
+	_ = writeAudit("tls.remove.started", true, domain)
+	if webServer == "apache" {
+		configPath := filepath.Join("/etc/apache2/sites-available", domain+".conf")
+		original, readErr := os.ReadFile(configPath)
+		if readErr != nil {
+			return status, readErr
+		}
+		_ = exec.Command("a2dissite", domain+"-le-ssl").Run()
+		if err := atomicWrite(configPath, []byte(stripApacheCertbotRedirect(string(original))), 0644); err != nil {
+			return status, err
+		}
+		rollback := func() {
+			_ = atomicWrite(configPath, original, 0644)
+			_ = exec.Command("a2ensite", domain+"-le-ssl").Run()
+			_ = exec.Command("systemctl", "reload", "apache2").Run()
+		}
+		if output, err := exec.Command("apache2ctl", "configtest").CombinedOutput(); err != nil {
+			rollback()
+			_ = writeAudit("tls.remove.failed", false, domain+": "+tail(string(output), 800))
+			return status, fmt.Errorf("Apache validation failed: %s", tail(string(output), 800))
+		}
+		if err := exec.Command("systemctl", "reload", "apache2").Run(); err != nil {
+			rollback()
+			return status, err
+		}
+		_ = os.Remove(filepath.Join("/etc/apache2/sites-available", domain+"-le-ssl.conf"))
+	} else {
+		configPath := filepath.Join("/etc/nginx/sites-available", domain)
+		original, readErr := os.ReadFile(configPath)
+		if readErr != nil {
+			return status, readErr
+		}
+		if err := atomicWrite(configPath, []byte(stripNginxTLS(string(original))), 0644); err != nil {
+			return status, err
+		}
+		rollback := func() {
+			_ = atomicWrite(configPath, original, 0644)
+			_ = exec.Command("systemctl", "reload", "nginx").Run()
+		}
+		if output, err := exec.Command("nginx", "-t").CombinedOutput(); err != nil {
+			rollback()
+			_ = writeAudit("tls.remove.failed", false, domain+": "+tail(string(output), 800))
+			return status, fmt.Errorf("Nginx validation failed: %s", tail(string(output), 800))
+		}
+		if err := exec.Command("systemctl", "reload", "nginx").Run(); err != nil {
+			rollback()
+			return status, err
+		}
+	}
+	// Delete certificate material only after the web server stopped referencing
+	// it, so a rollback above never points at missing files.
+	if output, err := exec.Command("certbot", "delete", "--cert-name", domain, "--non-interactive").CombinedOutput(); err != nil {
+		_ = writeAudit("tls.remove.failed", false, domain+": "+tail(string(output), 800))
+		return inspectTLS(domain), fmt.Errorf("HTTPS was disabled, but Certbot could not delete the certificate: %s", tail(string(output), 800))
+	}
+	_ = writeAudit("tls.remove.completed", true, domain)
+	return inspectTLS(domain), nil
+}
+
 type dnsChallenge struct {
 	Domain     string `json:"domain"`
 	Validation string `json:"validation"`
@@ -2607,7 +2804,7 @@ func deleteManagedFileEncoded(domain, path, permanentStr string) ([]managedFile,
 		if bytes, err := os.ReadFile(manifestPath); err == nil {
 			_ = json.Unmarshal(bytes, &manifest)
 		}
-		
+
 		relative, _ := filepath.Rel(root, target)
 		manifest = append(manifest, trashEntry{
 			TrashName:    trashName,
@@ -2663,7 +2860,7 @@ func restoreTrashedFileEncoded(domain, trashName string) ([]trashEntry, error) {
 	}
 	trashDir := filepath.Join(root, ".trash")
 	manifestPath := filepath.Join(trashDir, "manifest.json")
-	
+
 	var manifest []trashEntry
 	if bytes, err := os.ReadFile(manifestPath); err == nil {
 		_ = json.Unmarshal(bytes, &manifest)
@@ -2721,23 +2918,23 @@ func emptyTrashEncoded(domain string) ([]trashEntry, error) {
 	if _, err := os.Stat(trashDir); err != nil {
 		return []trashEntry{}, nil
 	}
-	
+
 	entries, err := os.ReadDir(trashDir)
 	if err == nil {
 		for _, entry := range entries {
 			_ = os.RemoveAll(filepath.Join(trashDir, entry.Name()))
 		}
 	}
-	
+
 	manifestPath := filepath.Join(trashDir, "manifest.json")
 	_ = atomicWrite(manifestPath, []byte("[]\n"), 0644)
-	
+
 	if stat, err := os.Stat(trashDir); err == nil {
 		if sysStat, ok := stat.Sys().(*syscall.Stat_t); ok {
 			_ = os.Chown(manifestPath, int(sysStat.Uid), int(sysStat.Gid))
 		}
 	}
-	
+
 	_ = writeAudit("file.trash_emptied", true, trashDir)
 	return []trashEntry{}, nil
 }
@@ -2763,7 +2960,7 @@ func createManagedDirEncoded(domain, path string) ([]managedFile, error) {
 		}
 	}
 	_ = writeAudit("file.create_dir", true, target)
-	
+
 	parentRel, _ := filepath.Rel(root, parent)
 	if parentRel == "." {
 		parentRel = ""
@@ -2890,7 +3087,6 @@ func chownManagedFileEncoded(domain, path, encodedOwner, encodedGroup string) ([
 	}
 	return listManagedFilesEncoded(domain, base64.RawURLEncoding.EncodeToString([]byte(parentRel)))
 }
-
 
 func configureMailFoundation() error {
 	_, _ = exec.Command("groupadd", "-g", "5000", "vmail").CombinedOutput()
@@ -5670,7 +5866,7 @@ func writeSoftwareConfig(id, encodedContent string) (string, error) {
 			return "", errors.New("invalid encoded content")
 		}
 	}
-	
+
 	backupPath := path + ".bak"
 	if originalBytes, err := os.ReadFile(path); err == nil {
 		_ = os.WriteFile(backupPath, originalBytes, 0644)
@@ -5739,7 +5935,7 @@ func deleteSite(domain string, deleteRoot bool) error {
 		return errors.New("site-delete must run as root")
 	}
 	domain = strings.ToLower(strings.TrimSpace(domain))
-	
+
 	metadataPath := filepath.Join("/var/lib/serverdeck/sites", domain+".json")
 	data, err := os.ReadFile(metadataPath)
 	if err != nil {
@@ -5784,7 +5980,7 @@ func updateSite(domain, newRoot, phpVersion string) error {
 	}
 	domain = strings.ToLower(strings.TrimSpace(domain))
 	newRoot = strings.TrimSpace(newRoot)
-	
+
 	metadataPath := filepath.Join("/var/lib/serverdeck/sites", domain+".json")
 	data, err := os.ReadFile(metadataPath)
 	if err != nil {
@@ -5804,7 +6000,7 @@ func updateSite(domain, newRoot, phpVersion string) error {
 	if err == nil {
 		configContent := string(configBytes)
 		configContent = strings.ReplaceAll(configContent, value.Root, newRoot)
-		
+
 		if phpVersion != "" && value.PHPVersion != phpVersion {
 			oldSocket := fmt.Sprintf("php%s-fpm.sock", value.PHPVersion)
 			newSocket := fmt.Sprintf("php%s-fpm.sock", phpVersion)
@@ -5835,7 +6031,7 @@ func updateSite(domain, newRoot, phpVersion string) error {
 	if phpVersion != "" {
 		value.PHPVersion = phpVersion
 	}
-	
+
 	metadata, _ := json.MarshalIndent(value, "", "  ")
 	if err := atomicWrite(metadataPath, append(metadata, '\n'), 0644); err != nil {
 		return err
@@ -5856,7 +6052,7 @@ func deleteDatabase(name string) error {
 		return errors.New("database-delete must run as root")
 	}
 	name = strings.ToLower(strings.TrimSpace(name))
-	
+
 	metadataPath := filepath.Join("/var/lib/serverdeck/databases", name+".json")
 	data, err := os.ReadFile(metadataPath)
 	if err != nil {

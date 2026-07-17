@@ -157,3 +157,47 @@ func TestResolveArchiveRootRejectsMissingSubPath(t *testing.T) {
 		t.Fatal("expected an error for a missing archive sub-path")
 	}
 }
+
+func TestStripNginxTLS(t *testing.T) {
+	config := `server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    ssl_certificate /etc/letsencrypt/live/example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/example.com/privkey.pem;
+    listen 80;
+    listen [::]:80;
+    server_name example.com www.example.com;
+    root /var/www/example.com;
+}`
+	stripped := stripNginxTLS(config)
+	for _, forbidden := range []string{"443", "ssl_certificate"} {
+		if strings.Contains(stripped, forbidden) {
+			t.Errorf("stripped configuration still contains %q:\n%s", forbidden, stripped)
+		}
+	}
+	for _, required := range []string{"listen 80;", "listen [::]:80;", "server_name example.com www.example.com;", "root /var/www/example.com;"} {
+		if !strings.Contains(stripped, required) {
+			t.Errorf("stripped configuration lost %q:\n%s", required, stripped)
+		}
+	}
+}
+
+func TestStripApacheCertbotRedirect(t *testing.T) {
+	config := `<VirtualHost *:80>
+    ServerName example.com
+    DocumentRoot /var/www/example.com
+    RewriteEngine on
+    RewriteCond %{SERVER_NAME} =example.com [OR]
+    RewriteCond %{SERVER_NAME} =www.example.com
+    RewriteRule ^ https://%{SERVER_NAME}%{REQUEST_URI} [END,NE,R=permanent]
+</VirtualHost>`
+	stripped := stripApacheCertbotRedirect(config)
+	if strings.Contains(stripped, "Rewrite") {
+		t.Errorf("stripped configuration still contains rewrite directives:\n%s", stripped)
+	}
+	for _, required := range []string{"ServerName example.com", "DocumentRoot /var/www/example.com"} {
+		if !strings.Contains(stripped, required) {
+			t.Errorf("stripped configuration lost %q:\n%s", required, stripped)
+		}
+	}
+}
