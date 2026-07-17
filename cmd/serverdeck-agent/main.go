@@ -26,7 +26,7 @@ import (
 
 
 const (
-	version         = "0.24.5"
+	version         = "0.24.6"
 	protocolVersion = 1
 )
 
@@ -132,14 +132,21 @@ type phpVersionStatus struct {
 	Support    string   `json:"support"`
 }
 
+type mailDomainInfo struct {
+	Domain    string   `json:"domain"`
+	DKIMReady bool     `json:"dkim_ready"`
+	Accounts  []string `json:"accounts"`
+}
+
 type mailStatus struct {
-	Hostname         string `json:"hostname"`
-	PostfixInstalled bool   `json:"postfix_installed"`
-	PostfixActive    bool   `json:"postfix_active"`
-	DovecotInstalled bool   `json:"dovecot_installed"`
-	DovecotActive    bool   `json:"dovecot_active"`
-	Mailname         string `json:"mailname,omitempty"`
-	ReadyForSetup    bool   `json:"ready_for_setup"`
+	Hostname         string           `json:"hostname"`
+	PostfixInstalled bool             `json:"postfix_installed"`
+	PostfixActive    bool             `json:"postfix_active"`
+	DovecotInstalled bool             `json:"dovecot_installed"`
+	DovecotActive    bool             `json:"dovecot_active"`
+	Mailname         string           `json:"mailname,omitempty"`
+	ReadyForSetup    bool             `json:"ready_for_setup"`
+	Domains          []mailDomainInfo `json:"domains"`
 }
 
 type dkimMaterial struct {
@@ -557,6 +564,55 @@ func main() {
 			break
 		}
 		data, err = checkMailDNS(checkDomain)
+	case "mail-domain-create":
+		if len(os.Args) != 3 {
+			err = errors.New("mail-domain-create requires an encoded domain")
+			break
+		}
+		domain, decodeErr := decodeArgument(os.Args[2])
+		if decodeErr != nil {
+			err = decodeErr
+			break
+		}
+		err = createMailDomain(domain)
+	case "mail-domain-delete":
+		if len(os.Args) != 3 {
+			err = errors.New("mail-domain-delete requires an encoded domain")
+			break
+		}
+		domain, decodeErr := decodeArgument(os.Args[2])
+		if decodeErr != nil {
+			err = decodeErr
+			break
+		}
+		err = deleteMailDomain(domain)
+	case "mail-account-create":
+		if len(os.Args) != 4 {
+			err = errors.New("mail-account-create requires encoded email and password")
+			break
+		}
+		email, emailErr := decodeArgument(os.Args[2])
+		password, passErr := decodeArgument(os.Args[3])
+		if emailErr != nil {
+			err = emailErr
+			break
+		}
+		if passErr != nil {
+			err = passErr
+			break
+		}
+		err = createMailAccount(email, password)
+	case "mail-account-delete":
+		if len(os.Args) != 3 {
+			err = errors.New("mail-account-delete requires an encoded email")
+			break
+		}
+		email, decodeErr := decodeArgument(os.Args[2])
+		if decodeErr != nil {
+			err = decodeErr
+			break
+		}
+		err = deleteMailAccount(email)
 	case "file-list":
 		if len(os.Args) != 4 {
 			err = errors.New("file-list requires an encoded domain and path")
@@ -2079,6 +2135,66 @@ func packageVersion(name string) string {
 	return ""
 }
 
+func listMailDomainsAndAccounts() []mailDomainInfo {
+	domainsMap := make(map[string]*mailDomainInfo)
+
+	if vhostsBytes, err := os.ReadFile("/etc/postfix/vhosts"); err == nil {
+		lines := strings.Split(string(vhostsBytes), "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			parts := strings.Fields(line)
+			if len(parts) > 0 {
+				domain := strings.ToLower(parts[0])
+				dkimReady := false
+				if _, statErr := os.Stat(filepath.Join("/etc/opendkim/keys", domain, "mail.private")); statErr == nil {
+					dkimReady = true
+				}
+				domainsMap[domain] = &mailDomainInfo{
+					Domain:    domain,
+					DKIMReady: dkimReady,
+					Accounts:  []string{},
+				}
+			}
+		}
+	}
+
+	if vmapsBytes, err := os.ReadFile("/etc/postfix/vmaps"); err == nil {
+		lines := strings.Split(string(vmapsBytes), "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			parts := strings.Fields(line)
+			if len(parts) > 0 {
+				email := strings.ToLower(parts[0])
+				idx := strings.Index(email, "@")
+				if idx > 0 && idx < len(email)-1 {
+					domain := email[idx+1:]
+					if info, exists := domainsMap[domain]; exists {
+						info.Accounts = append(info.Accounts, email)
+					}
+				}
+			}
+		}
+	}
+
+	domainsList := make([]mailDomainInfo, 0, len(domainsMap))
+	for _, info := range domainsMap {
+		sort.Strings(info.Accounts)
+		domainsList = append(domainsList, *info)
+	}
+
+	sort.Slice(domainsList, func(i, j int) bool {
+		return domainsList[i].Domain < domainsList[j].Domain
+	})
+
+	return domainsList
+}
+
 func inspectMail() (mailStatus, error) {
 	hostname, _ := os.Hostname()
 	status := mailStatus{
@@ -2087,11 +2203,15 @@ func inspectMail() (mailStatus, error) {
 		PostfixActive:    unitActive("postfix"),
 		DovecotInstalled: packageVersion("dovecot-core") != "",
 		DovecotActive:    unitActive("dovecot"),
+		Domains:          []mailDomainInfo{},
 	}
 	if value, err := os.ReadFile("/etc/mailname"); err == nil {
 		status.Mailname = strings.TrimSpace(string(value))
 	}
 	status.ReadyForSetup = status.PostfixInstalled && status.PostfixActive && status.DovecotInstalled && status.DovecotActive
+	if status.ReadyForSetup {
+		status.Domains = listMailDomainsAndAccounts()
+	}
 	return status, nil
 }
 
@@ -2696,6 +2816,54 @@ func chownManagedFileEncoded(domain, path, encodedOwner, encodedGroup string) ([
 }
 
 
+func configureMailFoundation() error {
+	_, _ = exec.Command("groupadd", "-g", "5000", "vmail").CombinedOutput()
+	_, _ = exec.Command("useradd", "-g", "vmail", "-u", "5000", "vmail", "-d", "/var/mail/vhosts", "-m", "-s", "/usr/sbin/nologin").CombinedOutput()
+
+	_ = os.MkdirAll("/var/mail/vhosts", 0770)
+	_ = exec.Command("chown", "-R", "vmail:vmail", "/var/mail/vhosts").Run()
+
+	for _, file := range []string{"/etc/postfix/vhosts", "/etc/postfix/vmaps", "/etc/dovecot/users"} {
+		if _, err := os.Stat(file); os.IsNotExist(err) {
+			_ = os.WriteFile(file, []byte(""), 0600)
+		}
+	}
+	_ = exec.Command("chown", "root:root", "/etc/postfix/vhosts", "/etc/postfix/vmaps").Run()
+	_ = os.Chmod("/etc/postfix/vhosts", 0600)
+	_ = os.Chmod("/etc/postfix/vmaps", 0600)
+	_ = exec.Command("chown", "dovecot:dovecot", "/etc/dovecot/users").Run()
+	_ = os.Chmod("/etc/dovecot/users", 0600)
+
+	postfixSettings := []string{
+		"virtual_mailbox_domains = hash:/etc/postfix/vhosts",
+		"virtual_mailbox_maps = hash:/etc/postfix/vmaps",
+		"virtual_transport = lmtp:unix:private/dovecot-lmtp",
+		"smtpd_sasl_type = dovecot",
+		"smtpd_sasl_path = private/auth",
+		"smtpd_sasl_auth_enable = yes",
+		"smtpd_recipient_restrictions = permit_mynetworks, permit_sasl_authenticated, reject_unauth_destination",
+	}
+	for _, setting := range postfixSettings {
+		_ = exec.Command("postconf", "-e", setting).Run()
+	}
+
+	mailConf := "mail_location = maildir:/var/mail/vhosts/%d/%n\nnamespace inbox {\n  inbox = yes\n}\n"
+	_ = os.WriteFile("/etc/dovecot/conf.d/10-mail.conf", []byte(mailConf), 0644)
+
+	authConf := "disable_plaintext_auth = yes\nauth_mechanisms = plain login\n!include auth-passwdfile.conf.ext\n"
+	_ = os.WriteFile("/etc/dovecot/conf.d/10-auth.conf", []byte(authConf), 0644)
+
+	authExt := "passdb {\n  driver = passwd-file\n  args = scheme=SHA512-CRYPT username_format=%u /etc/dovecot/users\n}\nuserdb {\n  driver = passwd-file\n  args = username_format=%u /etc/dovecot/users\n}\n"
+	_ = os.WriteFile("/etc/dovecot/conf.d/auth-passwdfile.conf.ext", []byte(authExt), 0644)
+
+	masterConf := "service lmtp {\n  unix_listener private/dovecot-lmtp {\n    mode = 0660\n    group = postfix\n    user = postfix\n  }\n}\nservice auth {\n  unix_listener private/auth {\n    mode = 0660\n    user = postfix\n    group = postfix\n  }\n}\n"
+	_ = os.WriteFile("/etc/dovecot/conf.d/10-master.conf", []byte(masterConf), 0644)
+
+	_ = exec.Command("postmap", "/etc/postfix/vhosts").Run()
+	_ = exec.Command("postmap", "/etc/postfix/vmaps").Run()
+	return nil
+}
+
 func installMailStack() (mailStatus, error) {
 	if os.Geteuid() != 0 {
 		return mailStatus{}, errors.New("mail-stack-install must run as root")
@@ -2710,6 +2878,11 @@ func installMailStack() (mailStatus, error) {
 	if err != nil {
 		return mailStatus{}, fmt.Errorf("install mail foundation: %s", tail(string(output), 1200))
 	}
+
+	if err := configureMailFoundation(); err != nil {
+		return mailStatus{}, fmt.Errorf("configure mail foundation: %w", err)
+	}
+
 	for _, unit := range []string{"postfix", "dovecot"} {
 		if output, err := exec.Command("systemctl", "enable", "--now", unit).CombinedOutput(); err != nil {
 			return mailStatus{}, fmt.Errorf("start %s: %s", unit, tail(string(output), 800))
@@ -5628,5 +5801,253 @@ func deleteDatabase(name string) error {
 
 	_ = os.Remove(metadataPath)
 	_ = writeAudit("database.deleted", true, name)
+	return nil
+}
+
+func createMailDomain(domain string) error {
+	if os.Geteuid() != 0 {
+		return errors.New("mail-domain-create must run as root")
+	}
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	if !domainPattern.MatchString(domain) {
+		return errors.New("invalid mail domain")
+	}
+
+	vhostsPath := "/etc/postfix/vhosts"
+	existing, err := os.ReadFile(vhostsPath)
+	if err != nil {
+		existing = []byte("")
+	}
+	lines := strings.Split(string(existing), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.Fields(line)
+		if len(parts) > 0 && strings.ToLower(parts[0]) == domain {
+			return errors.New("mail domain already exists")
+		}
+	}
+
+	newContent := string(existing)
+	if len(newContent) > 0 && !strings.HasSuffix(newContent, "\n") {
+		newContent += "\n"
+	}
+	newContent += domain + " OK\n"
+	if err := atomicWrite(vhostsPath, []byte(newContent), 0600); err != nil {
+		return err
+	}
+
+	_ = exec.Command("postmap", vhostsPath).Run()
+	_ = exec.Command("systemctl", "reload", "postfix").Run()
+
+	_ = writeAudit("mail.domain.created", true, domain)
+	return nil
+}
+
+func deleteMailDomain(domain string) error {
+	if os.Geteuid() != 0 {
+		return errors.New("mail-domain-delete must run as root")
+	}
+	domain = strings.ToLower(strings.TrimSpace(domain))
+
+	vhostsPath := "/etc/postfix/vhosts"
+	existing, err := os.ReadFile(vhostsPath)
+	if err == nil {
+		lines := strings.Split(string(existing), "\n")
+		var newLines []string
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" {
+				continue
+			}
+			parts := strings.Fields(trimmed)
+			if len(parts) > 0 && strings.ToLower(parts[0]) == domain {
+				continue
+			}
+			newLines = append(newLines, line)
+		}
+		_ = atomicWrite(vhostsPath, []byte(strings.Join(newLines, "\n")+"\n"), 0600)
+		_ = exec.Command("postmap", vhostsPath).Run()
+	}
+
+	vmapsPath := "/etc/postfix/vmaps"
+	if vmapsBytes, err := os.ReadFile(vmapsPath); err == nil {
+		lines := strings.Split(string(vmapsBytes), "\n")
+		var newLines []string
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" {
+				continue
+			}
+			parts := strings.Fields(trimmed)
+			if len(parts) > 0 {
+				email := strings.ToLower(parts[0])
+				idx := strings.Index(email, "@")
+				if idx > 0 && email[idx+1:] == domain {
+					continue
+				}
+			}
+			newLines = append(newLines, line)
+		}
+		_ = atomicWrite(vmapsPath, []byte(strings.Join(newLines, "\n")+"\n"), 0600)
+		_ = exec.Command("postmap", vmapsPath).Run()
+	}
+
+	dovecotUsersPath := "/etc/dovecot/users"
+	if usersBytes, err := os.ReadFile(dovecotUsersPath); err == nil {
+		lines := strings.Split(string(usersBytes), "\n")
+		var newLines []string
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" {
+				continue
+			}
+			parts := strings.Split(trimmed, ":")
+			if len(parts) > 0 {
+				email := strings.ToLower(parts[0])
+				idx := strings.Index(email, "@")
+				if idx > 0 && email[idx+1:] == domain {
+					continue
+				}
+			}
+			newLines = append(newLines, line)
+		}
+		_ = atomicWrite(dovecotUsersPath, []byte(strings.Join(newLines, "\n")+"\n"), 0600)
+	}
+
+	_ = os.RemoveAll(filepath.Join("/etc/opendkim/keys", domain))
+
+	_ = exec.Command("systemctl", "reload", "postfix").Run()
+	_ = exec.Command("systemctl", "reload", "dovecot").Run()
+
+	_ = writeAudit("mail.domain.deleted", true, domain)
+	return nil
+}
+
+func createMailAccount(email, password string) error {
+	if os.Geteuid() != 0 {
+		return errors.New("mail-account-create must run as root")
+	}
+	email = strings.ToLower(strings.TrimSpace(email))
+	idx := strings.Index(email, "@")
+	if idx <= 0 || idx >= len(email)-1 {
+		return errors.New("invalid email address format")
+	}
+	domain := email[idx+1:]
+
+	vhostsPath := "/etc/postfix/vhosts"
+	existingVhosts, err := os.ReadFile(vhostsPath)
+	if err != nil {
+		return errors.New("mail domain does not exist")
+	}
+	domainExists := false
+	for _, line := range strings.Split(string(existingVhosts), "\n") {
+		parts := strings.Fields(line)
+		if len(parts) > 0 && strings.ToLower(parts[0]) == domain {
+			domainExists = true
+			break
+		}
+	}
+	if !domainExists {
+		return errors.New("mail domain must be created in virtual domains first")
+	}
+
+	vmapsPath := "/etc/postfix/vmaps"
+	existingVmaps, err := os.ReadFile(vmapsPath)
+	if err == nil {
+		for _, line := range strings.Split(string(existingVmaps), "\n") {
+			parts := strings.Fields(line)
+			if len(parts) > 0 && strings.ToLower(parts[0]) == email {
+				return errors.New("mailbox account already exists")
+			}
+		}
+	}
+
+	output, err := exec.Command("openssl", "passwd", "-6", password).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("generate secure password hash: %s", tail(string(output), 500))
+	}
+	passHash := strings.TrimSpace(string(output))
+
+	newVmaps := string(existingVmaps)
+	if len(newVmaps) > 0 && !strings.HasSuffix(newVmaps, "\n") {
+		newVmaps += "\n"
+	}
+	newVmaps += fmt.Sprintf("%s %s/%s/\n", email, domain, email[:idx])
+	if err := atomicWrite(vmapsPath, []byte(newVmaps), 0600); err != nil {
+		return err
+	}
+
+	dovecotUsersPath := "/etc/dovecot/users"
+	existingUsers, err := os.ReadFile(dovecotUsersPath)
+	if err != nil {
+		existingUsers = []byte("")
+	}
+	newUsers := string(existingUsers)
+	if len(newUsers) > 0 && !strings.HasSuffix(newUsers, "\n") {
+		newUsers += "\n"
+	}
+	newUsers += fmt.Sprintf("%s:%s:5000:5000::/var/mail/vhosts/%s/%s\n", email, passHash, domain, email[:idx])
+	if err := atomicWrite(dovecotUsersPath, []byte(newUsers), 0600); err != nil {
+		return err
+	}
+
+	_ = exec.Command("postmap", vmapsPath).Run()
+	_ = exec.Command("systemctl", "reload", "postfix").Run()
+	_ = exec.Command("systemctl", "reload", "dovecot").Run()
+
+	_ = writeAudit("mail.account.created", true, email)
+	return nil
+}
+
+func deleteMailAccount(email string) error {
+	if os.Geteuid() != 0 {
+		return errors.New("mail-account-delete must run as root")
+	}
+	email = strings.ToLower(strings.TrimSpace(email))
+
+	vmapsPath := "/etc/postfix/vmaps"
+	if vmapsBytes, err := os.ReadFile(vmapsPath); err == nil {
+		lines := strings.Split(string(vmapsBytes), "\n")
+		var newLines []string
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" {
+				continue
+			}
+			parts := strings.Fields(trimmed)
+			if len(parts) > 0 && strings.ToLower(parts[0]) == email {
+				continue
+			}
+			newLines = append(newLines, line)
+		}
+		_ = atomicWrite(vmapsPath, []byte(strings.Join(newLines, "\n")+"\n"), 0600)
+		_ = exec.Command("postmap", vmapsPath).Run()
+	}
+
+	dovecotUsersPath := "/etc/dovecot/users"
+	if usersBytes, err := os.ReadFile(dovecotUsersPath); err == nil {
+		lines := strings.Split(string(usersBytes), "\n")
+		var newLines []string
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" {
+				continue
+			}
+			parts := strings.Split(trimmed, ":")
+			if len(parts) > 0 && strings.ToLower(parts[0]) == email {
+				continue
+			}
+			newLines = append(newLines, line)
+		}
+		_ = atomicWrite(dovecotUsersPath, []byte(strings.Join(newLines, "\n")+"\n"), 0600)
+	}
+
+	_ = exec.Command("systemctl", "reload", "postfix").Run()
+	_ = exec.Command("systemctl", "reload", "dovecot").Run()
+
+	_ = writeAudit("mail.account.deleted", true, email)
 	return nil
 }
