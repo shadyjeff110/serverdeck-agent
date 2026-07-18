@@ -49,6 +49,7 @@ type wpSite struct {
 	Permalink       string   `json:"permalink,omitempty"`
 	SearchVisible   bool     `json:"searchVisible"`
 	Users           []wpUser `json:"users"`
+	Warning         string   `json:"warning,omitempty"`
 }
 
 func wpDownloadFile(url, dest string) error {

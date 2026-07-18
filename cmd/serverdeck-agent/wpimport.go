@@ -60,11 +60,40 @@ func wpressField(b []byte) string {
 }
 
 type wpressPackage struct {
-	SiteURL  string `json:"SiteURL"`
-	HomeURL  string `json:"HomeURL"`
-	Database struct {
+	SiteURL    string   `json:"SiteURL"`
+	HomeURL    string   `json:"HomeURL"`
+	Template   string   `json:"Template"`
+	Stylesheet string   `json:"Stylesheet"`
+	Plugins    []string `json:"Plugins"`
+	Database   struct {
 		Prefix string `json:"Prefix"`
 	} `json:"Database"`
+	PHP struct {
+		Version string `json:"Version"`
+	} `json:"PHP"`
+}
+
+var (
+	wpSlugPattern       = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)
+	wpPluginFilePattern = regexp.MustCompile(`^[A-Za-z0-9_./-]{1,128}$`)
+)
+
+// majorVersion returns the leading major component of a version string.
+func majorVersion(value string) int {
+	parts := strings.SplitN(strings.TrimSpace(value), ".", 2)
+	major, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 0
+	}
+	return major
+}
+
+func serverPHPVersion() string {
+	output, err := exec.Command("php", "-r", "echo PHP_VERSION;").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
 }
 
 // parseWPressPackage reads just the package.json entry to learn the origin URL
@@ -313,6 +342,27 @@ func importWPress(domain, session string) (wpSite, error) {
 	}
 	_, _ = runWPCLI(root, "option", "update", "siteurl", newURL)
 	_, _ = runWPCLI(root, "option", "update", "home", newURL)
+
+	// AI1WM blanks the theme/plugin options in its dump and carries them in
+	// package.json instead; without restoring them WordPress loads no theme at
+	// all and renders a blank page.
+	emitProgress("wpimport", "running", "Restoring theme and active plugins")
+	if wpSlugPattern.MatchString(pkg.Template) {
+		_, _ = runWPCLI(root, "option", "update", "template", pkg.Template, "--skip-plugins", "--skip-themes")
+	}
+	if wpSlugPattern.MatchString(pkg.Stylesheet) {
+		_, _ = runWPCLI(root, "option", "update", "stylesheet", pkg.Stylesheet, "--skip-plugins", "--skip-themes")
+	}
+	plugins := []string{}
+	for _, plugin := range pkg.Plugins {
+		if wpPluginFilePattern.MatchString(plugin) {
+			plugins = append(plugins, plugin)
+		}
+	}
+	if encoded, err := json.Marshal(plugins); err == nil {
+		_, _ = runWPCLI(root, "option", "update", "active_plugins", string(encoded), "--format=json", "--skip-plugins", "--skip-themes")
+	}
+
 	// Migrate the schema if the imported DB is older than the installed core.
 	_, _ = runWPCLI(root, "core", "update-db")
 	_, _ = runWPCLI(root, "rewrite", "flush", "--hard")
@@ -320,5 +370,20 @@ func importWPress(domain, session string) (wpSite, error) {
 
 	emitProgress("wpimport", "completed", "Import complete")
 	_ = writeAudit("wp.import.completed", true, domain+" from .wpress")
-	return getWordPressSite(domain)
+
+	imported, err := getWordPressSite(domain)
+	if err != nil {
+		return imported, err
+	}
+	// The origin's PHP is recorded in package.json. Running a newer site's
+	// themes/plugins on an older PHP typically fails with a blank page, so say
+	// so plainly rather than leaving the user to guess.
+	serverPHP := serverPHPVersion()
+	if originMajor := majorVersion(pkg.PHP.Version); originMajor > 0 {
+		if serverMajor := majorVersion(serverPHP); serverMajor > 0 && serverMajor < originMajor {
+			imported.Warning = fmt.Sprintf("This backup came from PHP %s, but this server runs PHP %s. Themes or plugins written for PHP %d will fail to parse (usually a blank page). Move this site to a server with PHP %d, or upgrade this server's PHP.", pkg.PHP.Version, serverPHP, originMajor, originMajor)
+			emitProgress("wpimport", "warning", imported.Warning)
+		}
+	}
+	return imported, nil
 }
