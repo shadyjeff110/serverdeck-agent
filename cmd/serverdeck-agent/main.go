@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	version         = "0.32.0"
+	version         = "0.33.0"
 	protocolVersion = 1
 )
 
@@ -911,6 +911,8 @@ func main() {
 			break
 		}
 		data, err = updateWordPressCore(domain)
+	case "system-reboot":
+		data, err = rebootServer()
 	case "wp-import":
 		if len(os.Args) != 4 {
 			err = errors.New("wp-import requires an encoded domain and session")

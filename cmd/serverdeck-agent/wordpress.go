@@ -52,6 +52,24 @@ type wpSite struct {
 	Warning         string   `json:"warning,omitempty"`
 }
 
+// rebootServer schedules a reboot a few seconds out so this command can return
+// a response before the SSH connection drops.
+func rebootServer() (map[string]string, error) {
+	if os.Geteuid() != 0 {
+		return nil, errors.New("system-reboot must run as root")
+	}
+	_ = writeAudit("system.reboot", true, "requested from ServerDeck")
+	if output, err := exec.Command("systemd-run", "--on-active=3", "--timer-property=AccuracySec=1s", "systemctl", "reboot").CombinedOutput(); err == nil {
+		return map[string]string{"status": "The server is restarting in a few seconds."}, nil
+	} else {
+		// Fall back to shutdown(8) where systemd-run is unavailable.
+		if fallback, fallbackErr := exec.Command("shutdown", "-r", "+1").CombinedOutput(); fallbackErr != nil {
+			return nil, fmt.Errorf("schedule reboot: %s | %s", tail(string(output), 300), tail(string(fallback), 300))
+		}
+	}
+	return map[string]string{"status": "The server will restart in about a minute."}, nil
+}
+
 func wpDownloadFile(url, dest string) error {
 	client := &http.Client{Timeout: 180 * time.Second}
 	response, err := client.Get(url)
