@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -43,7 +42,7 @@ func rewriteSQLPrefix(sqlPath, targetPrefix string) error {
 	if !wpPrefixPattern.MatchString(targetPrefix) {
 		return errors.New("invalid table prefix")
 	}
-	if output, err := exec.Command("sed", "-i", "s/SERVMASK_PREFIX_/"+targetPrefix+"/g", sqlPath).CombinedOutput(); err != nil {
+	if output, err := run("sed", "-i", "s/SERVMASK_PREFIX_/"+targetPrefix+"/g", sqlPath); err != nil {
 		return fmt.Errorf("rewrite table prefix: %s", tail(string(output), 300))
 	}
 	return nil
@@ -89,7 +88,7 @@ func majorVersion(value string) int {
 }
 
 func serverPHPVersion() string {
-	output, err := exec.Command("php", "-r", "echo PHP_VERSION;").Output()
+	output, err := runOutputWithTimeout(defaultTimeout, "php", "-r", "echo PHP_VERSION;")
 	if err != nil {
 		return ""
 	}
@@ -214,9 +213,12 @@ func importDatabaseSQL(dbName, engine, sqlPath string) error {
 		return err
 	}
 	defer file.Close()
-	command := exec.Command("mariadb", dbName)
+	command, cancelCommand := commandContext(longTimeout, "mariadb", dbName)
+	defer cancelCommand()
 	if engine == "MySQL" {
-		command = exec.Command("mysql", dbName)
+		command2, cancelCommand2 := commandContext(longTimeout, "mysql", dbName)
+		command = command2
+		defer cancelCommand2()
 	}
 	command.Stdin = file
 	if output, err := command.CombinedOutput(); err != nil {
@@ -264,11 +266,12 @@ func importWPress(domain, session string) (wpSite, error) {
 	if _, err := os.Stat(filepath.Join("/var/lib/serverdeck/sites", domain+".json")); err == nil {
 		return wpSite{}, errors.New("a managed site with this domain already exists; imports always create a new site")
 	}
-	archive := filepath.Join("/tmp", "serverdeck-import-"+session+".wpress")
+	_ = os.MkdirAll(uploadStagingDir, 0700)
+	archive := filepath.Join(uploadStagingDir, "import-"+session+".wpress")
 	if _, err := os.Stat(archive); err != nil {
 		return wpSite{}, errors.New("the uploaded backup was not found")
 	}
-	sqlPath := filepath.Join("/tmp", "serverdeck-import-"+session+".sql")
+	sqlPath := filepath.Join(uploadStagingDir, "import-"+session+".sql")
 	defer os.Remove(archive)
 	defer os.Remove(sqlPath)
 
@@ -329,7 +332,7 @@ func importWPress(domain, session string) (wpSite, error) {
 	}
 
 	// Ownership so the web server and WP-CLI can read/write the imported files.
-	_ = exec.Command("chown", "-R", "www-data:www-data", filepath.Dir(root)).Run()
+	_, _ = run("chown", "-R", "www-data:www-data", filepath.Dir(root))
 
 	newURL := "https://" + domain
 	if old := strings.TrimSpace(pkg.SiteURL); old != "" && old != newURL {

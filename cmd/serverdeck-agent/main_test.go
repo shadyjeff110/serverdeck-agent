@@ -109,6 +109,9 @@ func TestAppDefinitionsAreReviewed(t *testing.T) {
 		if definition.download.checksumURL != "" && !strings.HasPrefix(definition.download.checksumURL, "https://") {
 			t.Errorf("app %q checksum must use HTTPS", definition.id)
 		}
+		if definition.download.expectedSHA256 != "" && !regexp.MustCompile(`^[a-f0-9]{64}$`).MatchString(definition.download.expectedSHA256) {
+			t.Errorf("app %q has an invalid pinned SHA-256", definition.id)
+		}
 		if hasGitHub {
 			if definition.download.assetPattern == "" {
 				t.Errorf("app %q needs an asset pattern", definition.id)
