@@ -90,7 +90,7 @@ func listImages() (dockerImageInventory, error) {
 	if !installed || !active {
 		return result, nil
 	}
-	output, err := exec.Command("docker", "images", "--format", "{{json .}}").CombinedOutput()
+	output, err := run("docker", "images", "--format", "{{json .}}")
 	if err != nil {
 		return result, fmt.Errorf("list images: %s", tail(string(output), 800))
 	}
@@ -142,7 +142,7 @@ func removeImage(ref string) (dockerImageInventory, error) {
 	if !imageRefPattern.MatchString(ref) {
 		return dockerImageInventory{}, errors.New("invalid image reference")
 	}
-	if output, err := exec.Command("docker", "rmi", "--", ref).CombinedOutput(); err != nil {
+	if output, err := run("docker", "rmi", "--", ref); err != nil {
 		return dockerImageInventory{}, fmt.Errorf("remove image: %s", tail(string(output), 800))
 	}
 	_ = writeAudit("docker.image.remove", true, ref)
@@ -233,10 +233,10 @@ func ensureNetwork(name string) error {
 	if name == "" {
 		return nil
 	}
-	if err := exec.Command("docker", "network", "inspect", "--", name).Run(); err == nil {
+	if err := mustRun("docker", "network", "inspect", "--", name); err == nil {
 		return nil
 	}
-	if output, err := exec.Command("docker", "network", "create", "--", name).CombinedOutput(); err != nil {
+	if output, err := run("docker", "network", "create", "--", name); err != nil {
 		return fmt.Errorf("create network %s: %s", name, tail(string(output), 400))
 	}
 	return nil
@@ -265,7 +265,7 @@ func createContainer(specJSON string) (containerInventory, error) {
 			return containerInventory{}, fmt.Errorf("create volume directory: %w", err)
 		}
 	}
-	if output, err := exec.Command("docker", args...).CombinedOutput(); err != nil {
+	if output, err := run("docker", args...); err != nil {
 		_ = writeAudit("docker.container.create.failed", false, spec.Name+": "+tail(string(output), 400))
 		return containerInventory{}, fmt.Errorf("create container: %s", tail(string(output), 800))
 	}
@@ -281,7 +281,7 @@ func removeContainer(name string) (containerInventory, error) {
 	if !containerNamePattern.MatchString(name) {
 		return containerInventory{}, errors.New("invalid container name")
 	}
-	if output, err := exec.Command("docker", "rm", "-f", "--", name).CombinedOutput(); err != nil {
+	if output, err := run("docker", "rm", "-f", "--", name); err != nil {
 		return containerInventory{}, fmt.Errorf("remove container: %s", tail(string(output), 800))
 	}
 	_ = writeAudit("docker.container.remove", true, name)
@@ -325,7 +325,7 @@ func publishContainer(domain string, hostPort int) (site, error) {
 	}
 	config := fmt.Sprintf("server {\n    listen 80;\n    listen [::]:80;\n    server_name %s;\n    location / {\n        proxy_pass http://127.0.0.1:%d;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n    }\n}\n", domain, hostPort)
 	if webServer == "apache" {
-		if output, err := exec.Command("a2enmod", "proxy", "proxy_http", "headers").CombinedOutput(); err != nil {
+		if output, err := run("a2enmod", "proxy", "proxy_http", "headers"); err != nil {
 			return value, fmt.Errorf("enable Apache proxy modules: %s", tail(string(output), 800))
 		}
 		config = fmt.Sprintf("<VirtualHost *:80>\n    ServerName %s\n    ProxyPreserveHost On\n    ProxyPass / http://127.0.0.1:%d/\n    ProxyPassReverse / http://127.0.0.1:%d/\n    RequestHeader set X-Forwarded-Proto expr=%%{REQUEST_SCHEME}\n</VirtualHost>\n", domain, hostPort, hostPort)
@@ -338,24 +338,27 @@ func publishContainer(domain string, hostPort int) (site, error) {
 			_ = os.Remove(configPath)
 			return value, err
 		}
-	} else if output, err := exec.Command("a2ensite", domain+".conf").CombinedOutput(); err != nil {
+	} else if output, err := run("a2ensite", domain+".conf"); err != nil {
 		_ = os.Remove(configPath)
 		return value, fmt.Errorf("enable Apache site: %s", tail(string(output), 800))
 	}
 	rollback := func() {
 		_ = os.Remove(enabledPath)
 		_ = os.Remove(configPath)
-		_ = exec.Command("systemctl", "reload", map[string]string{"nginx": "nginx", "apache": "apache2"}[webServer]).Run()
+		_, _ = run("systemctl", "reload", map[string]string{"nginx": "nginx", "apache": "apache2"}[webServer])
 	}
-	validation := exec.Command("nginx", "-t")
+	validation, cancelValidation := commandContext(defaultTimeout, "nginx", "-t")
+	defer cancelValidation()
 	if webServer == "apache" {
-		validation = exec.Command("apache2ctl", "configtest")
+		validation2, cancelValidation2 := commandContext(defaultTimeout, "apache2ctl", "configtest")
+		validation = validation2
+		defer cancelValidation2()
 	}
 	if output, err := validation.CombinedOutput(); err != nil {
 		rollback()
 		return value, fmt.Errorf("%s validation failed: %s", webServer, tail(string(output), 800))
 	}
-	if err := exec.Command("systemctl", "reload", map[string]string{"nginx": "nginx", "apache": "apache2"}[webServer]).Run(); err != nil {
+	if err := mustRun("systemctl", "reload", map[string]string{"nginx": "nginx", "apache": "apache2"}[webServer]); err != nil {
 		rollback()
 		return value, err
 	}
@@ -513,7 +516,7 @@ type composeInventory struct {
 // implementation (v2 plugin `docker compose`, or the standalone
 // `docker-compose`), or ok=false when neither is installed.
 func composeCommand() ([]string, bool) {
-	if err := exec.Command("docker", "compose", "version").Run(); err == nil {
+	if err := mustRun("docker", "compose", "version"); err == nil {
 		return []string{"docker", "compose"}, true
 	}
 	if _, err := exec.LookPath("docker-compose"); err == nil {
@@ -532,7 +535,7 @@ func runCompose(dir string, stream bool, extra ...string) ([]byte, error) {
 	if stream {
 		return runProgressCommand(prefix[0], args...)
 	}
-	return exec.Command(prefix[0], args...).CombinedOutput()
+	return run(prefix[0], args...)
 }
 
 func listComposeProjects() (composeInventory, error) {

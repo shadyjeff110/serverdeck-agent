@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/user"
 	"path/filepath"
 	"regexp"
@@ -59,11 +58,11 @@ func rebootServer() (map[string]string, error) {
 		return nil, errors.New("system-reboot must run as root")
 	}
 	_ = writeAudit("system.reboot", true, "requested from ServerDeck")
-	if output, err := exec.Command("systemd-run", "--on-active=3", "--timer-property=AccuracySec=1s", "systemctl", "reboot").CombinedOutput(); err == nil {
+	if output, err := run("systemd-run", "--on-active=3", "--timer-property=AccuracySec=1s", "systemctl", "reboot"); err == nil {
 		return map[string]string{"status": "The server is restarting in a few seconds."}, nil
 	} else {
 		// Fall back to shutdown(8) where systemd-run is unavailable.
-		if fallback, fallbackErr := exec.Command("shutdown", "-r", "+1").CombinedOutput(); fallbackErr != nil {
+		if fallback, fallbackErr := run("shutdown", "-r", "+1"); fallbackErr != nil {
 			return nil, fmt.Errorf("schedule reboot: %s | %s", tail(string(output), 300), tail(string(fallback), 300))
 		}
 	}
@@ -140,6 +139,15 @@ func wwwDataCredential() (*syscall.Credential, error) {
 
 // runWPCLI executes a WP-CLI command as www-data against a site's docroot.
 func runWPCLI(root string, args ...string) ([]byte, error) {
+	return runWPCLIWithStdin(root, "", args...)
+}
+
+// runWPCLIWithStdin is the same, with data on standard input.
+//
+// wp-cli accepts a password with --prompt=user_pass read from stdin, which keeps
+// it out of /proc/<pid>/cmdline. Passing --user_pass=<password> as an argument
+// exposed it to every local user for the lifetime of the command.
+func runWPCLIWithStdin(root string, stdin string, args ...string) ([]byte, error) {
 	wp, err := ensureWPCLI()
 	if err != nil {
 		return nil, err
@@ -149,9 +157,18 @@ func runWPCLI(root string, args ...string) ([]byte, error) {
 		return nil, err
 	}
 	arguments := append([]string{"--path=" + root, "--no-color"}, args...)
-	command := exec.Command(wp, arguments...)
+	command, cancelCommand := commandContext(defaultTimeout, wp, arguments...)
+	defer cancelCommand()
 	command.SysProcAttr = &syscall.SysProcAttr{Credential: credential}
-	command.Env = append(os.Environ(), "HOME=/tmp", "WP_CLI_CACHE_DIR=/tmp/.wp-cli-cache")
+	// Not /tmp: a predictable path in a world-writable directory invites a
+	// symlink from another local user, and /tmp is memory-backed on many systems.
+	cacheDir := "/var/lib/serverdeck/wp-cli-cache"
+	_ = os.MkdirAll(cacheDir, 0700)
+	_ = os.Chown(cacheDir, int(credential.Uid), int(credential.Gid))
+	command.Env = append(os.Environ(), "HOME="+cacheDir, "WP_CLI_CACHE_DIR="+cacheDir)
+	if stdin != "" {
+		command.Stdin = strings.NewReader(stdin)
+	}
 	return command.CombinedOutput()
 }
 
@@ -374,7 +391,7 @@ func resetWordPressPassword(domain, login, password string) error {
 	if _, err := runWPCLI(root, "user", "get", login, "--field=ID", "--skip-plugins", "--skip-themes"); err != nil {
 		return errors.New("that user does not exist on this site")
 	}
-	out, err := runWPCLI(root, "user", "update", login, "--user_pass="+password, "--skip-plugins", "--skip-themes")
+	out, err := runWPCLIWithStdin(root, password+"\n", "user", "update", login, "--prompt=user_pass", "--skip-plugins", "--skip-themes")
 	if err != nil {
 		return fmt.Errorf("reset password: %s", tail(string(out), 400))
 	}

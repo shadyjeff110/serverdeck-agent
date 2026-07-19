@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/rsa"
@@ -30,7 +31,7 @@ import (
 )
 
 const (
-	version         = "0.33.0"
+	version         = "0.42.0"
 	protocolVersion = 1
 )
 
@@ -64,6 +65,12 @@ type site struct {
 	Service     string `json:"service,omitempty"`
 	Port        int    `json:"port,omitempty"`
 	WebServer   string `json:"web_server,omitempty"`
+	// Set when a database was created alongside the site, so the association
+	// exists for sites that are not one of the packaged applications.
+	Database     string `json:"database,omitempty"`
+	DatabaseUser string `json:"database_user,omitempty"`
+	// Present only in the response that creates it, never in the stored record.
+	DatabasePassword string `json:"database_password,omitempty"`
 }
 
 type phpRuntime struct {
@@ -373,6 +380,54 @@ func main() {
 		}
 	case "services":
 		data, err = inspectServices()
+	case "cron-list":
+		data, err = listCronJobs()
+	case "cron-add":
+		if len(os.Args) != 5 {
+			err = errors.New("cron-add requires an encoded schedule, user, and command")
+			break
+		}
+		var addSchedule, addUsername, addCommand string
+		addSchedule, err = decodeArgument(os.Args[2])
+		if err == nil {
+			addUsername, err = decodeArgument(os.Args[3])
+		}
+		if err == nil {
+			addCommand, err = decodeArgument(os.Args[4])
+		}
+		if err == nil {
+			data, err = addCronJob(addSchedule, addUsername, addCommand)
+		}
+	case "cron-update":
+		if len(os.Args) != 6 {
+			err = errors.New("cron-update requires an encoded ID, schedule, user, and command")
+			break
+		}
+		var updateID, updateSchedule, updateUsername, updateCommand string
+		updateID, err = decodeArgument(os.Args[2])
+		if err == nil {
+			updateSchedule, err = decodeArgument(os.Args[3])
+		}
+		if err == nil {
+			updateUsername, err = decodeArgument(os.Args[4])
+		}
+		if err == nil {
+			updateCommand, err = decodeArgument(os.Args[5])
+		}
+		if err == nil {
+			data, err = updateCronJob(updateID, updateSchedule, updateUsername, updateCommand)
+		}
+	case "cron-delete":
+		if len(os.Args) != 3 {
+			err = errors.New("cron-delete requires an encoded job ID")
+			break
+		}
+		id, decodeErr := decodeArgument(os.Args[2])
+		if decodeErr != nil {
+			err = decodeErr
+			break
+		}
+		data, err = deleteCronJob(id)
 	case "public-address":
 		data, err = detectPublicAddress()
 	case "stack-plan":
@@ -417,14 +472,15 @@ func main() {
 	case "site-list":
 		data, err = listSites()
 	case "site-create":
-		if len(os.Args) != 4 {
-			err = errors.New("site-create requires an encoded domain and site kind")
+		if len(os.Args) != 6 {
+			err = errors.New("site-create requires a domain, kind, canonical host, and database flag")
 			break
 		}
 		var decoded []byte
 		decoded, err = base64.RawURLEncoding.DecodeString(os.Args[2])
 		if err == nil {
-			data, err = createSite(string(decoded), os.Args[3])
+			data, err = createSiteWithDatabase(string(decoded), os.Args[3],
+				parseCanonicalHost(os.Args[4]), os.Args[5] == "true")
 		}
 	case "app-catalog":
 		data, err = appCatalog()
@@ -487,6 +543,261 @@ func main() {
 			break
 		}
 		data, err = enablePackageSource(sourceID)
+	case "source-disable":
+		if len(os.Args) != 3 {
+			err = errors.New("source-disable requires an encoded catalog ID")
+			break
+		}
+		sourceID, decodeErr := decodeArgument(os.Args[2])
+		if decodeErr != nil {
+			err = decodeErr
+			break
+		}
+		data, err = disablePackageSource(sourceID)
+	case "source-add-ppa":
+		if len(os.Args) != 3 {
+			err = errors.New("source-add-ppa requires an encoded PPA reference")
+			break
+		}
+		reference, decodeErr := decodeArgument(os.Args[2])
+		if decodeErr != nil {
+			err = decodeErr
+			break
+		}
+		data, err = addPPA(reference)
+	case "source-remove-ppa":
+		if len(os.Args) != 3 {
+			err = errors.New("source-remove-ppa requires an encoded PPA reference")
+			break
+		}
+		reference, decodeErr := decodeArgument(os.Args[2])
+		if decodeErr != nil {
+			err = decodeErr
+			break
+		}
+		data, err = removePPA(reference)
+	// The only command permitted to touch apt's cache. Everything else reads
+	// what this leaves behind; see updatecheck.go.
+	case "site-clone-plan":
+		if len(os.Args) != 4 {
+			err = errors.New("site-clone-plan requires encoded source and target domains")
+			break
+		}
+		sourceDomain, sourceErr := decodeArgument(os.Args[2])
+		targetDomain, targetErr := decodeArgument(os.Args[3])
+		if sourceErr != nil || targetErr != nil {
+			err = errors.New("could not decode the domains")
+			break
+		}
+		data, err = planClone(strings.ToLower(sourceDomain), strings.ToLower(targetDomain))
+	case "site-clone":
+		if len(os.Args) != 4 {
+			err = errors.New("site-clone requires encoded source and target domains")
+			break
+		}
+		sourceDomain, sourceErr := decodeArgument(os.Args[2])
+		targetDomain, targetErr := decodeArgument(os.Args[3])
+		if sourceErr != nil || targetErr != nil {
+			err = errors.New("could not decode the domains")
+			break
+		}
+		data, err = cloneSite(strings.ToLower(sourceDomain), strings.ToLower(targetDomain))
+	case "server-identity":
+		data, err = readServerIdentity()
+	case "server-hostname-set":
+		if len(os.Args) != 3 {
+			err = errors.New("server-hostname-set requires an encoded host name")
+			break
+		}
+		hostname, decodeErr := decodeArgument(os.Args[2])
+		if decodeErr != nil {
+			err = decodeErr
+			break
+		}
+		data, err = setHostname(hostname)
+	case "server-timezone-set":
+		if len(os.Args) != 3 {
+			err = errors.New("server-timezone-set requires an encoded time zone")
+			break
+		}
+		zone, decodeErr := decodeArgument(os.Args[2])
+		if decodeErr != nil {
+			err = decodeErr
+			break
+		}
+		data, err = setTimezone(zone)
+	case "server-timezone-list":
+		data, err = listTimezones()
+	// Unified backups. See backupv2.go for why site and server share a format.
+	case "backup-create-v2":
+		data, err = createServerBackup()
+	case "backup-create-site":
+		if len(os.Args) != 5 {
+			err = errors.New("backup-create-site requires a domain and two content flags")
+			break
+		}
+		backupDomain, decodeErr := decodeArgument(os.Args[2])
+		if decodeErr != nil {
+			err = decodeErr
+			break
+		}
+		data, err = createSiteBackup(backupDomain, os.Args[3] == "true", os.Args[4] == "true")
+	case "disk-report":
+		data, err = reportDisk()
+	case "maintenance-sweep":
+		data, err = sweepStaleWork()
+	case "maintenance-timer-install":
+		err = installMaintenanceTimer()
+	case "backup-list-v2":
+		data, err = listAllBackups()
+	case "backup-delete":
+		if len(os.Args) != 3 {
+			err = errors.New("backup-delete requires an encoded backup id")
+			break
+		}
+		backupIdentifier, decodeErr := decodeArgument(os.Args[2])
+		if decodeErr != nil {
+			err = decodeErr
+			break
+		}
+		data, err = deleteBackup(backupIdentifier)
+	case "backup-restore-v2":
+		if len(os.Args) != 3 {
+			err = errors.New("backup-restore-v2 requires an encoded backup id")
+			break
+		}
+		backupIdentifier, decodeErr := decodeArgument(os.Args[2])
+		if decodeErr != nil {
+			err = decodeErr
+			break
+		}
+		data, err = restoreBackupV2(backupIdentifier)
+	case "backup-restore-site":
+		if len(os.Args) != 5 {
+			err = errors.New("backup-restore-site requires a backup id, source domain, and target domain")
+			break
+		}
+		backupIdentifier, idErr := decodeArgument(os.Args[2])
+		sourceDomain, sourceErr := decodeArgument(os.Args[3])
+		restoreTarget, targetErr := decodeArgument(os.Args[4])
+		if idErr != nil || sourceErr != nil || targetErr != nil {
+			err = errors.New("could not decode the restore arguments")
+			break
+		}
+		data, err = restoreSiteFromBackup(backupIdentifier, sourceDomain, restoreTarget)
+	// Streams any backup archive to stdout for download.
+	case "backup-download":
+		if len(os.Args) != 3 {
+			fmt.Fprintln(os.Stderr, "backup-download requires an encoded backup id")
+			os.Exit(2)
+		}
+		backupIdentifier, decodeErr := decodeArgument(os.Args[2])
+		if decodeErr != nil {
+			fmt.Fprintln(os.Stderr, "invalid backup id")
+			os.Exit(2)
+		}
+		manifest, manifestErr := readBackupManifest(backupIdentifier)
+		if manifestErr != nil {
+			fmt.Fprintln(os.Stderr, manifestErr)
+			os.Exit(1)
+		}
+		file, openErr := os.Open(manifest.Archive)
+		if openErr != nil {
+			fmt.Fprintln(os.Stderr, openErr)
+			os.Exit(1)
+		}
+		defer file.Close()
+		if _, copyErr := io.Copy(os.Stdout, file); copyErr != nil {
+			fmt.Fprintln(os.Stderr, copyErr)
+			os.Exit(1)
+		}
+		return
+	case "site-export":
+		if len(os.Args) != 3 {
+			err = errors.New("site-export requires an encoded domain")
+			break
+		}
+		exportDomain, decodeErr := decodeArgument(os.Args[2])
+		if decodeErr != nil {
+			err = decodeErr
+			break
+		}
+		data, err = exportSite(exportDomain)
+	case "site-export-list":
+		data, err = listSiteExports()
+	case "site-export-delete":
+		if len(os.Args) != 3 {
+			err = errors.New("site-export-delete requires an encoded export id")
+			break
+		}
+		exportID, decodeErr := decodeArgument(os.Args[2])
+		if decodeErr != nil {
+			err = decodeErr
+			break
+		}
+		err = deleteSiteExport(exportID)
+	// Streams the archive to stdout for the app to save; deliberately not
+	// wrapped in the JSON envelope, like backup-export.
+	case "site-export-download":
+		if len(os.Args) != 3 {
+			fmt.Fprintln(os.Stderr, "site-export-download requires an encoded export id")
+			os.Exit(2)
+		}
+		exportID, decodeErr := decodeArgument(os.Args[2])
+		if decodeErr != nil || exportID == "" || strings.ContainsAny(exportID, "/\\") || strings.Contains(exportID, "..") {
+			fmt.Fprintln(os.Stderr, "invalid export id")
+			os.Exit(2)
+		}
+		file, openErr := os.Open(filepath.Join(siteExportDir, exportID+siteExportSuffix))
+		if openErr != nil {
+			fmt.Fprintln(os.Stderr, openErr)
+			os.Exit(1)
+		}
+		defer file.Close()
+		if _, copyErr := io.Copy(os.Stdout, file); copyErr != nil {
+			fmt.Fprintln(os.Stderr, copyErr)
+			os.Exit(1)
+		}
+		return
+	case "site-import-plan":
+		if len(os.Args) != 4 {
+			err = errors.New("site-import-plan requires a session and encoded domain")
+			break
+		}
+		importTarget, decodeErr := decodeArgument(os.Args[3])
+		if decodeErr != nil {
+			err = decodeErr
+			break
+		}
+		data, err = planSiteImport(os.Args[2], importTarget)
+	case "site-import":
+		if len(os.Args) != 4 {
+			err = errors.New("site-import requires a session and encoded domain")
+			break
+		}
+		importTarget, decodeErr := decodeArgument(os.Args[3])
+		if decodeErr != nil {
+			err = decodeErr
+			break
+		}
+		data, err = importSite(os.Args[2], importTarget)
+	case "staging-list":
+		data, err = listStaging()
+	case "staging-refresh":
+		if len(os.Args) != 3 {
+			err = errors.New("staging-refresh requires an encoded domain")
+			break
+		}
+		stagingDomain, decodeErr := decodeArgument(os.Args[2])
+		if decodeErr != nil {
+			err = decodeErr
+			break
+		}
+		data, err = refreshStaging(strings.ToLower(stagingDomain))
+	case "software-check-updates":
+		data, err = checkForUpdates(true)
+	case "software-update-status":
+		data = updateStatus()
 	case "software-install":
 		if len(os.Args) != 3 {
 			err = errors.New("software-install requires an encoded catalog ID")
@@ -1237,51 +1548,76 @@ func main() {
 }
 
 func detectPublicAddress() (map[string]string, error) {
-	client := &http.Client{Timeout: 8 * time.Second}
+	var failures []string
+	for _, network := range []string{"tcp4", "tcp6"} {
+		address, err := detectPublicAddressForNetwork(network)
+		if err == nil {
+			family := "IPv6"
+			if network == "tcp4" {
+				family = "IPv4"
+			}
+			return map[string]string{"address": address, "source": "Cloudflare " + family}, nil
+		}
+		failures = append(failures, err.Error())
+	}
+	return nil, fmt.Errorf("detect public address: %s", strings.Join(failures, "; "))
+}
+
+func detectPublicAddressForNetwork(network string) (string, error) {
+	if network != "tcp4" && network != "tcp6" {
+		return "", errors.New("unsupported address family")
+	}
+	dialer := &net.Dialer{Timeout: 8 * time.Second}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = func(ctx context.Context, _, address string) (net.Conn, error) {
+		return dialer.DialContext(ctx, network, address)
+	}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Timeout: 8 * time.Second, Transport: transport}
 	request, err := http.NewRequest(http.MethodGet, "https://www.cloudflare.com/cdn-cgi/trace", nil)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	request.Header.Set("User-Agent", "ServerDeck-Agent/"+version)
 	response, err := client.Do(request)
 	if err != nil {
-		return nil, fmt.Errorf("detect public address: %w", err)
+		return "", fmt.Errorf("%s request: %w", network, err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("detect public address: HTTP %d", response.StatusCode)
+		return "", fmt.Errorf("%s request: HTTP %d", network, response.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(response.Body, 16*1024))
 	if err != nil {
-		return nil, fmt.Errorf("read public address response: %w", err)
+		return "", fmt.Errorf("read %s response: %w", network, err)
 	}
 	for _, line := range strings.Split(string(body), "\n") {
 		if strings.HasPrefix(line, "ip=") {
 			address := strings.TrimSpace(strings.TrimPrefix(line, "ip="))
-			if net.ParseIP(address) == nil {
-				return nil, errors.New("public address service returned an invalid IP")
+			parsed := net.ParseIP(address)
+			if parsed == nil || (network == "tcp4" && parsed.To4() == nil) || (network == "tcp6" && parsed.To4() != nil) {
+				return "", fmt.Errorf("public address service returned an invalid %s address", network)
 			}
-			return map[string]string{"address": address, "source": "Cloudflare"}, nil
+			return address, nil
 		}
 	}
-	return nil, errors.New("public address was not present in the detection response")
+	return "", fmt.Errorf("public %s address was not present in the detection response", network)
 }
 
+// upgradablePattern matches one line of `apt list --upgradable`.
+var upgradablePattern = regexp.MustCompile(`^([^/]+)/\S+\s+(\S+)\s+\S+\s+\[upgradable from: ([^]]+)\]`)
+
+// listSystemUpdates runs on every refresh, so it only ever reads the cache.
+//
+// Falling back to apt when the cache is cold would reintroduce the ~77 MB spike
+// this whole split exists to remove. An empty result means "not checked yet",
+// which the Updates tab renders as a prompt rather than as "no updates".
 func listSystemUpdates() ([]updatePackage, error) {
-	output, err := exec.Command("apt", "list", "--upgradable").CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf("list updates: %s", tail(string(output), 800))
+	packages, ok := cachedUpgradableReadOnly()
+	if !ok {
+		return []updatePackage{}, nil
 	}
-	values := []updatePackage{}
-	pattern := regexp.MustCompile(`^([^/]+)/\S+\s+(\S+)\s+\S+\s+\[upgradable from: ([^]]+)\]`)
-	for _, line := range strings.Split(string(output), "\n") {
-		match := pattern.FindStringSubmatch(strings.TrimSpace(line))
-		if len(match) == 4 {
-			values = append(values, updatePackage{Name: match[1], Candidate: match[2], Current: match[3]})
-		}
-	}
-	sort.Slice(values, func(i, j int) bool { return values[i].Name < values[j].Name })
-	return values, nil
+	return packages, nil
 }
 
 func applySystemUpdates() (updateResult, error) {
@@ -1301,13 +1637,19 @@ func applySystemUpdates() (updateResult, error) {
 		return result, fmt.Errorf("create update safety backup: %w", err)
 	}
 	_ = writeAudit("system.update.started", true, fmt.Sprintf("%d packages; safety %s", len(updates), safety.ID))
-	command := exec.Command("apt-get", "update")
+	// The package list and the upgrade both change what is upgradable.
+	defer invalidateUpdateCache()
+
+	command, cancelRefresh := commandContext(longTimeout, "apt-get", append(aptLockArgs, "update")...)
+	defer cancelRefresh()
 	command.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
 	if output, err := command.CombinedOutput(); err != nil {
 		_ = writeAudit("system.update.failed", false, tail(string(output), 800))
 		return result, fmt.Errorf("refresh packages: %s", tail(string(output), 800))
 	}
-	command = exec.Command("apt-get", "upgrade", "-y")
+
+	command, cancelUpgrade := commandContext(longTimeout, "apt-get", append(aptLockArgs, "upgrade", "-y")...)
+	defer cancelUpgrade()
 	command.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive", "NEEDRESTART_MODE=a")
 	output, err := command.CombinedOutput()
 	if err != nil {
@@ -1321,7 +1663,7 @@ func applySystemUpdates() (updateResult, error) {
 }
 
 func firewallIsActive() bool {
-	output, _ := exec.Command("ufw", "status").CombinedOutput()
+	output, _ := run("ufw", "status")
 	for _, line := range strings.Split(string(output), "\n") {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "Status:") {
@@ -1338,18 +1680,18 @@ func enableFirewall(sshPort int) (securityStatus, error) {
 	if sshPort < 1 || sshPort > 65535 {
 		return securityStatus{}, errors.New("invalid SSH port")
 	}
-	_ = exec.Command("systemctl", "stop", "serverdeck-firewall-rollback.timer").Run()
-	_ = exec.Command("systemctl", "reset-failed", "serverdeck-firewall-rollback.service").Run()
-	if output, err := exec.Command("systemd-run", "--unit=serverdeck-firewall-rollback", "--on-active=2m", "/usr/sbin/ufw", "--force", "disable").CombinedOutput(); err != nil {
+	_, _ = run("systemctl", "stop", "serverdeck-firewall-rollback.timer")
+	_, _ = run("systemctl", "reset-failed", "serverdeck-firewall-rollback.service")
+	if output, err := run("systemd-run", "--unit=serverdeck-firewall-rollback", "--on-active=2m", "/usr/sbin/ufw", "--force", "disable"); err != nil {
 		return securityStatus{}, fmt.Errorf("schedule firewall rollback: %s", tail(string(output), 800))
 	}
 	rules := [][]string{{"allow", fmt.Sprintf("%d/tcp", sshPort), "comment", "ServerDeck SSH"}, {"allow", "80/tcp", "comment", "ServerDeck HTTP"}, {"allow", "443/tcp", "comment", "ServerDeck HTTPS"}}
 	for _, arguments := range rules {
-		if output, err := exec.Command("ufw", arguments...).CombinedOutput(); err != nil {
+		if output, err := run("ufw", arguments...); err != nil {
 			return securityStatus{}, fmt.Errorf("add firewall rule: %s", tail(string(output), 800))
 		}
 	}
-	if output, err := exec.Command("ufw", "--force", "enable").CombinedOutput(); err != nil {
+	if output, err := run("ufw", "--force", "enable"); err != nil {
 		return securityStatus{}, fmt.Errorf("enable firewall: %s", tail(string(output), 800))
 	}
 	_ = writeAudit("firewall.enable.pending", true, fmt.Sprintf("SSH %d; rollback in 2 minutes", sshPort))
@@ -1360,8 +1702,8 @@ func confirmFirewall() (securityStatus, error) {
 	if os.Geteuid() != 0 {
 		return securityStatus{}, errors.New("firewall-confirm must run as root")
 	}
-	_ = exec.Command("systemctl", "stop", "serverdeck-firewall-rollback.timer").Run()
-	_ = exec.Command("systemctl", "stop", "serverdeck-firewall-rollback.service").Run()
+	_, _ = run("systemctl", "stop", "serverdeck-firewall-rollback.timer")
+	_, _ = run("systemctl", "stop", "serverdeck-firewall-rollback.service")
 	_ = writeAudit("firewall.enable.confirmed", true, "fresh SSH connection verified")
 	return inspectSecurity()
 }
@@ -1370,8 +1712,8 @@ func disableFirewall() (securityStatus, error) {
 	if os.Geteuid() != 0 {
 		return securityStatus{}, errors.New("firewall-disable must run as root")
 	}
-	_ = exec.Command("systemctl", "stop", "serverdeck-firewall-rollback.timer").Run()
-	if output, err := exec.Command("ufw", "--force", "disable").CombinedOutput(); err != nil {
+	_, _ = run("systemctl", "stop", "serverdeck-firewall-rollback.timer")
+	if output, err := run("ufw", "--force", "disable"); err != nil {
 		return securityStatus{}, fmt.Errorf("disable firewall: %s", tail(string(output), 800))
 	}
 	_ = writeAudit("firewall.disabled", true, "UFW disabled")
@@ -1380,7 +1722,7 @@ func disableFirewall() (securityStatus, error) {
 
 func inspectSecurity() (securityStatus, error) {
 	value := securityStatus{FirewallRules: []string{}, Findings: []string{}}
-	ufwOutput, _ := exec.Command("ufw", "status").CombinedOutput()
+	ufwOutput, _ := run("ufw", "status")
 	for _, line := range strings.Split(string(ufwOutput), "\n") {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "Status:") {
@@ -1392,7 +1734,7 @@ func inspectSecurity() (securityStatus, error) {
 	}
 	value.Fail2banInstalled = strings.TrimSpace(systemctl("show", "fail2ban.service", "--property=LoadState", "--value")) == "loaded"
 	value.Fail2banActive = strings.TrimSpace(systemctl("is-active", "fail2ban.service")) == "active"
-	sshdOutput, _ := exec.Command("sshd", "-T").CombinedOutput()
+	sshdOutput, _ := run("sshd", "-T")
 	for _, line := range strings.Split(string(sshdOutput), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) != 2 {
@@ -1407,12 +1749,8 @@ func inspectSecurity() (securityStatus, error) {
 			value.PubkeyAuthentication = fields[1]
 		}
 	}
-	updates, _ := exec.Command("apt", "list", "--upgradable").CombinedOutput()
-	for _, line := range strings.Split(string(updates), "\n") {
-		if strings.Contains(line, "/") && !strings.HasPrefix(line, "Listing") {
-			value.UpdatesAvailable++
-		}
-	}
+	// Shares the cached apt result rather than re-running the query.
+	value.UpdatesAvailable = cachedUpgradableCount()
 	if !value.FirewallActive {
 		value.Findings = append(value.Findings, "Firewall is not active")
 	}
@@ -1438,17 +1776,17 @@ func installFail2ban() (securityStatus, error) {
 	if os.Geteuid() != 0 {
 		return securityStatus{}, errors.New("security-install-fail2ban must run as root")
 	}
-	if output, err := exec.Command("apt-get", "install", "-y", "--no-install-recommends", "fail2ban").CombinedOutput(); err != nil {
+	if output, err := runLong("apt-get", "-o", "DPkg::Lock::Timeout=30", "install", "-y", "--no-install-recommends", "fail2ban"); err != nil {
 		return securityStatus{}, fmt.Errorf("install Fail2ban: %s", tail(string(output), 800))
 	}
 	configuration := "[sshd]\nenabled = true\nbackend = systemd\nmaxretry = 5\nfindtime = 10m\nbantime = 1h\n"
 	if err := atomicWrite("/etc/fail2ban/jail.d/serverdeck.local", []byte(configuration), 0644); err != nil {
 		return securityStatus{}, err
 	}
-	if output, err := exec.Command("systemctl", "enable", "--now", "fail2ban").CombinedOutput(); err != nil {
+	if output, err := run("systemctl", "enable", "--now", "fail2ban"); err != nil {
 		return securityStatus{}, fmt.Errorf("enable Fail2ban: %s", tail(string(output), 800))
 	}
-	if err := exec.Command("systemctl", "restart", "fail2ban").Run(); err != nil {
+	if err := mustRun("systemctl", "restart", "fail2ban"); err != nil {
 		return securityStatus{}, err
 	}
 	_ = writeAudit("security.fail2ban.installed", true, "sshd jail enabled")
@@ -1480,7 +1818,7 @@ func readServiceLogs(name string, lines int) (serviceLogs, error) {
 	if lines < 1 || lines > 1000 {
 		return serviceLogs{}, errors.New("log line count must be between 1 and 1000")
 	}
-	output, err := exec.Command("journalctl", "--unit", name+".service", "--no-pager", "--lines", strconv.Itoa(lines), "--output", "short-iso").CombinedOutput()
+	output, err := run("journalctl", "--unit", name+".service", "--no-pager", "--lines", strconv.Itoa(lines), "--output", "short-iso")
 	if err != nil {
 		return serviceLogs{}, fmt.Errorf("read service logs: %s", tail(string(output), 1000))
 	}
@@ -1497,7 +1835,7 @@ func controlService(name, action string) (service, error) {
 	if action != "start" && action != "stop" && action != "restart" {
 		return service{}, errors.New("action must be start, stop, or restart")
 	}
-	output, err := exec.Command("systemctl", action, name+".service").CombinedOutput()
+	output, err := run("systemctl", action, name+".service")
 	if err != nil {
 		_ = writeAudit("service."+action+".failed", false, name+": "+tail(string(output), 800))
 		return service{}, fmt.Errorf("service %s failed: %s", action, tail(string(output), 800))
@@ -1523,7 +1861,7 @@ func inspectMonitoring() (monitoringStatus, error) {
 		value.Load5, _ = strconv.ParseFloat(fields[1], 64)
 		value.Load15, _ = strconv.ParseFloat(fields[2], 64)
 	}
-	failed, _ := exec.Command("systemctl", "--failed", "--no-legend", "--plain", "--no-pager").Output()
+	failed, _ := runOutputWithTimeout(defaultTimeout, "systemctl", "--failed", "--no-legend", "--plain", "--no-pager")
 	for _, line := range strings.Split(string(failed), "\n") {
 		parts := strings.Fields(line)
 		if len(parts) > 0 {
@@ -1578,8 +1916,8 @@ func setBackupPolicy(hour, retention int) (backupPolicy, error) {
 	if err := atomicWrite("/var/lib/serverdeck/backup-policy.json", append(encoded, '\n'), 0644); err != nil {
 		return backupPolicy{}, err
 	}
-	_ = exec.Command("systemctl", "daemon-reload").Run()
-	if output, err := exec.Command("systemctl", "enable", "--now", "serverdeck-backup.timer").CombinedOutput(); err != nil {
+	_, _ = run("systemctl", "daemon-reload")
+	if output, err := run("systemctl", "enable", "--now", "serverdeck-backup.timer"); err != nil {
 		return backupPolicy{}, fmt.Errorf("enable backup timer: %s", tail(string(output), 800))
 	}
 	_ = writeAudit("backup.policy.updated", true, fmt.Sprintf("daily %02d:00 retain %d", hour, retention))
@@ -1590,7 +1928,9 @@ func runScheduledBackup() (map[string]interface{}, error) {
 	if os.Geteuid() != 0 {
 		return nil, errors.New("backup-run must run as root")
 	}
-	created, err := createBackup()
+	// The unified format, so a scheduled backup is the same thing as one made by
+	// hand and appears in the same list.
+	created, err := createServerBackup()
 	if err != nil {
 		return nil, err
 	}
@@ -1598,7 +1938,7 @@ func runScheduledBackup() (map[string]interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	removed, err := pruneBackups(policy.Retention)
+	removed, err := pruneBackupsToRetention(policy.Retention)
 	if err != nil {
 		return nil, err
 	}
@@ -1697,7 +2037,7 @@ func restoreBackup(id string) (restoreResult, error) {
 		return result, err
 	}
 	defer os.RemoveAll(staging)
-	if output, err := exec.Command("tar", "-xzf", value.Archive, "-C", staging).CombinedOutput(); err != nil {
+	if output, err := runLong("tar", "-xzf", value.Archive, "-C", staging); err != nil {
 		return result, fmt.Errorf("extract backup: %s", tail(string(output), 800))
 	}
 
@@ -1710,7 +2050,7 @@ func restoreBackup(id string) (restoreResult, error) {
 		serverSafety := filepath.Join(configSafety, serverName)
 		_ = os.MkdirAll(serverSafety, 0755)
 		for _, directory := range []string{"sites-available", "sites-enabled"} {
-			_ = exec.Command("cp", "-a", filepath.Join("/etc", serverName, directory), serverSafety).Run()
+			_, _ = run("cp", "-a", filepath.Join("/etc", serverName, directory), serverSafety)
 		}
 	}
 	rollbackWebConfig := func() {
@@ -1719,22 +2059,22 @@ func restoreBackup(id string) (restoreResult, error) {
 				saved := filepath.Join(configSafety, serverName, directory)
 				if _, err := os.Stat(saved); err == nil {
 					_ = os.RemoveAll(filepath.Join("/etc", serverName, directory))
-					_ = exec.Command("cp", "-a", saved, filepath.Join("/etc", serverName)+"/").Run()
+					_, _ = run("cp", "-a", saved, filepath.Join("/etc", serverName)+"/")
 				}
 			}
 		}
 		if packageVersion("nginx") != "" {
-			_ = exec.Command("systemctl", "reload", "nginx").Run()
+			_, _ = run("systemctl", "reload", "nginx")
 		}
 		if packageVersion("apache2") != "" {
-			_ = exec.Command("systemctl", "reload", "apache2").Run()
+			_, _ = run("systemctl", "reload", "apache2")
 		}
 	}
 	for _, serverName := range []string{"nginx", "apache2"} {
 		for _, directory := range []string{"sites-available", "sites-enabled"} {
 			source := filepath.Join(staging, "etc", serverName, directory)
 			if _, err := os.Stat(source); err == nil {
-				if output, err := exec.Command("cp", "-a", source+"/.", filepath.Join("/etc", serverName, directory)).CombinedOutput(); err != nil {
+				if output, err := run("cp", "-a", source+"/.", filepath.Join("/etc", serverName, directory)); err != nil {
 					rollbackWebConfig()
 					return result, fmt.Errorf("restore %s configuration: %s", serverName, tail(string(output), 800))
 				}
@@ -1746,7 +2086,7 @@ func restoreBackup(id string) (restoreResult, error) {
 		for _, pair := range pairs {
 			if _, err := os.Stat(pair[0]); err == nil {
 				_ = os.RemoveAll(pair[1])
-				if output, err := exec.Command("cp", "-a", pair[0], pair[1]).CombinedOutput(); err != nil {
+				if output, err := run("cp", "-a", pair[0], pair[1]); err != nil {
 					rollbackWebConfig()
 					return result, fmt.Errorf("restore site %s: %s", domain, tail(string(output), 800))
 				}
@@ -1754,21 +2094,21 @@ func restoreBackup(id string) (restoreResult, error) {
 		}
 	}
 	if packageVersion("nginx") != "" {
-		if output, err := exec.Command("nginx", "-t").CombinedOutput(); err != nil {
+		if output, err := run("nginx", "-t"); err != nil {
 			rollbackWebConfig()
 			return result, fmt.Errorf("restored Nginx validation failed: %s", tail(string(output), 800))
 		}
-		if err := exec.Command("systemctl", "reload", "nginx").Run(); err != nil {
+		if err := mustRun("systemctl", "reload", "nginx"); err != nil {
 			rollbackWebConfig()
 			return result, err
 		}
 	}
 	if packageVersion("apache2") != "" {
-		if output, err := exec.Command("apache2ctl", "configtest").CombinedOutput(); err != nil {
+		if output, err := run("apache2ctl", "configtest"); err != nil {
 			rollbackWebConfig()
 			return result, fmt.Errorf("restored Apache validation failed: %s", tail(string(output), 800))
 		}
-		if err := exec.Command("systemctl", "reload", "apache2").Run(); err != nil {
+		if err := mustRun("systemctl", "reload", "apache2"); err != nil {
 			rollbackWebConfig()
 			return result, err
 		}
@@ -1790,11 +2130,16 @@ func restoreBackup(id string) (restoreResult, error) {
 				engine = managed.Engine
 			}
 		}
-		command := exec.Command("mariadb", name)
+		command, cancelCommand := commandContext(longTimeout, "mariadb", name)
+		defer cancelCommand()
 		if engine == "MySQL" {
-			command = exec.Command("mysql", name)
+			command2, cancelCommand2 := commandContext(longTimeout, "mysql", name)
+			command = command2
+			defer cancelCommand2()
 		} else if engine == "PostgreSQL" {
-			command = exec.Command("runuser", "-u", "postgres", "--", "psql", "--set", "ON_ERROR_STOP=1", "--dbname", name)
+			command2, cancelCommand3 := commandContext(longTimeout, "runuser", "-u", "postgres", "--", "psql", "--set", "ON_ERROR_STOP=1", "--dbname", name)
+			command = command2
+			defer cancelCommand3()
 		}
 		command.Stdin = file
 		output, importErr := command.CombinedOutput()
@@ -1867,11 +2212,16 @@ func createBackup() (backup, error) {
 	databaseNames := make([]string, 0, len(databases))
 	for _, database := range databases {
 		destination := filepath.Join(root, "databases", database.Name+".sql")
-		command := exec.Command("mariadb-dump", "--single-transaction", "--routines", "--triggers", "--result-file="+destination, database.Name)
+		command, cancelCommand4 := commandContext(longTimeout, "mariadb-dump", "--single-transaction", "--routines", "--triggers", "--result-file="+destination, database.Name)
+		defer cancelCommand4()
 		if database.Engine == "MySQL" {
-			command = exec.Command("mysqldump", "--single-transaction", "--routines", "--triggers", "--result-file="+destination, database.Name)
+			command2, cancelCommand5 := commandContext(longTimeout, "mysqldump", "--single-transaction", "--routines", "--triggers", "--result-file="+destination, database.Name)
+			command = command2
+			defer cancelCommand5()
 		} else if database.Engine == "PostgreSQL" {
-			command = exec.Command("runuser", "-u", "postgres", "--", "pg_dump", "--clean", "--if-exists", "--file", destination, database.Name)
+			command2, cancelCommand6 := commandContext(longTimeout, "runuser", "-u", "postgres", "--", "pg_dump", "--clean", "--if-exists", "--file", destination, database.Name)
+			command = command2
+			defer cancelCommand6()
 		}
 		if output, err := command.CombinedOutput(); err != nil {
 			_ = writeAudit("backup.create.failed", false, database.Name+": "+tail(string(output), 800))
@@ -1897,7 +2247,7 @@ func createBackup() (backup, error) {
 	}
 	units, _ := filepath.Glob("/etc/systemd/system/serverdeck-*.service")
 	paths = append(paths, units...)
-	if output, err := exec.Command("tar", paths...).CombinedOutput(); err != nil {
+	if output, err := runLong("tar", paths...); err != nil {
 		_ = writeAudit("backup.create.failed", false, tail(string(output), 800))
 		return value, fmt.Errorf("archive creation failed: %s", tail(string(output), 800))
 	}
@@ -2007,7 +2357,7 @@ func inspectTLSWithServerIPs(domain string, serverIPs []string) tlsStatus {
 	certificatePath := filepath.Join("/etc/letsencrypt/live", domain, "cert.pem")
 	if _, err := os.Stat(certificatePath); err == nil {
 		status.Certificate = true
-		if output, err := exec.Command("openssl", "x509", "-in", certificatePath, "-noout", "-enddate").Output(); err == nil {
+		if output, err := runOutputWithTimeout(defaultTimeout, "openssl", "x509", "-in", certificatePath, "-noout", "-enddate"); err == nil {
 			status.ExpiresAt = strings.TrimSpace(strings.TrimPrefix(string(output), "notAfter="))
 		}
 	}
@@ -2089,9 +2439,11 @@ func issueTLS(domain, email string, force bool) (tlsStatus, error) {
 		if email != "" {
 			args = append(args, "--email", email)
 		}
-		args = append(args, "--domain", domain)
+		args = append(args, "--domain", normaliseHost(domain))
 		if withWWW {
-			args = append(args, "--domain", "www."+domain)
+			if alias, ok := wwwAliasFor(domain); ok {
+				args = append(args, "--domain", alias)
+			}
 		}
 		return args
 	}
@@ -2100,21 +2452,34 @@ func issueTLS(domain, email string, force bool) (tlsStatus, error) {
 	} else {
 		_ = writeAudit("tls.issue.started", true, domain)
 	}
-	if output, err := exec.Command("certbot", buildArgs(true)...).CombinedOutput(); err != nil {
-		// Fallback: try issuing only for the apex domain in case www is not pointed
-		if fallbackOutput, fallbackErr := exec.Command("certbot", buildArgs(false)...).CombinedOutput(); fallbackErr != nil {
+
+	// Only attempt the www name when the domain actually has one. Asking for
+	// www.blog.example.com always fails validation, and Let's Encrypt allows
+	// just five failures per hostname per hour — a budget worth not spending on
+	// a request that cannot succeed.
+	_, hasWWW := wwwAliasFor(domain)
+	if output, err := runLong("certbot", buildArgs(hasWWW)...); err != nil {
+		// A registrable domain whose www record simply is not pointed here yet:
+		// retry with the bare name so the site still gets a certificate.
+		if !hasWWW {
 			_ = atomicWrite(configPath, original, 0644)
-			_ = exec.Command("systemctl", "reload", map[string]string{"nginx": "nginx", "apache": "apache2"}[webServer]).Run()
+			_, _ = run("systemctl", "reload", map[string]string{"nginx": "nginx", "apache": "apache2"}[webServer])
+			_ = writeAudit("tls.issue.failed", false, domain+": "+tail(string(output), 800))
+			return readiness, fmt.Errorf("Certbot failed: %s", tail(string(output), 800))
+		}
+		if fallbackOutput, fallbackErr := runLong("certbot", buildArgs(false)...); fallbackErr != nil {
+			_ = atomicWrite(configPath, original, 0644)
+			_, _ = run("systemctl", "reload", map[string]string{"nginx": "nginx", "apache": "apache2"}[webServer])
 			_ = writeAudit("tls.issue.failed", false, domain+": "+tail(string(output)+"\nFallback: "+string(fallbackOutput), 800))
 			return readiness, fmt.Errorf("Certbot failed: %s", tail(string(output), 800))
 		}
 	}
 	if webServer == "apache" {
-		if output, err := exec.Command("apache2ctl", "configtest").CombinedOutput(); err != nil {
+		if output, err := run("apache2ctl", "configtest"); err != nil {
 			_ = writeAudit("tls.issue.failed", false, domain+": "+tail(string(output), 800))
 			return readiness, fmt.Errorf("Apache TLS validation failed: %s", tail(string(output), 800))
 		}
-		if err := exec.Command("systemctl", "reload", "apache2").Run(); err != nil {
+		if err := mustRun("systemctl", "reload", "apache2"); err != nil {
 			return readiness, err
 		}
 		_ = writeAudit("tls.issue.completed", true, domain)
@@ -2129,23 +2494,25 @@ func issueTLS(domain, email string, force bool) (tlsStatus, error) {
 
 func configureNginxTLS(domain, configPath string, original []byte) error {
 	certificatePath := filepath.Join("/etc/letsencrypt/live", domain)
-	tlsBlock := fmt.Sprintf("\n    listen 443 ssl;\n    listen [::]:443 ssl;\n    ssl_certificate %s/fullchain.pem;\n    ssl_certificate_key %s/privkey.pem;\n", certificatePath, certificatePath)
-	updated := string(original)
-	if !strings.Contains(updated, "listen 443 ssl") {
-		updated = strings.Replace(updated, "server {", "server {"+tlsBlock, 1)
+	// See nginxtls.go: this replaces a blind insert into the first server block,
+	// which stopped being the serving block once canonical redirects existed, and
+	// it adds the HTTP to HTTPS redirect certonly never writes.
+	updated, err := nginxTLSConfig(string(original), domain, certificatePath, canonicalNonWWW)
+	if err != nil {
+		return err
 	}
 	if err := atomicWrite(configPath, []byte(updated), 0644); err != nil {
 		return err
 	}
 	rollback := func() {
 		_ = atomicWrite(configPath, original, 0644)
-		_ = exec.Command("systemctl", "reload", "nginx").Run()
+		_, _ = run("systemctl", "reload", "nginx")
 	}
-	if output, err := exec.Command("nginx", "-t").CombinedOutput(); err != nil {
+	if output, err := run("nginx", "-t"); err != nil {
 		rollback()
 		return fmt.Errorf("Nginx TLS validation failed: %s", tail(string(output), 800))
 	}
-	if err := exec.Command("systemctl", "reload", "nginx").Run(); err != nil {
+	if err := mustRun("systemctl", "reload", "nginx"); err != nil {
 		rollback()
 		return err
 	}
@@ -2272,21 +2639,21 @@ func removeTLS(domain string) (tlsStatus, error) {
 		if readErr != nil {
 			return status, readErr
 		}
-		_ = exec.Command("a2dissite", domain+"-le-ssl").Run()
+		_, _ = run("a2dissite", domain+"-le-ssl")
 		if err := atomicWrite(configPath, []byte(stripApacheCertbotRedirect(string(original))), 0644); err != nil {
 			return status, err
 		}
 		rollback := func() {
 			_ = atomicWrite(configPath, original, 0644)
-			_ = exec.Command("a2ensite", domain+"-le-ssl").Run()
-			_ = exec.Command("systemctl", "reload", "apache2").Run()
+			_, _ = run("a2ensite", domain+"-le-ssl")
+			_, _ = run("systemctl", "reload", "apache2")
 		}
-		if output, err := exec.Command("apache2ctl", "configtest").CombinedOutput(); err != nil {
+		if output, err := run("apache2ctl", "configtest"); err != nil {
 			rollback()
 			_ = writeAudit("tls.remove.failed", false, domain+": "+tail(string(output), 800))
 			return status, fmt.Errorf("Apache validation failed: %s", tail(string(output), 800))
 		}
-		if err := exec.Command("systemctl", "reload", "apache2").Run(); err != nil {
+		if err := mustRun("systemctl", "reload", "apache2"); err != nil {
 			rollback()
 			return status, err
 		}
@@ -2302,21 +2669,21 @@ func removeTLS(domain string) (tlsStatus, error) {
 		}
 		rollback := func() {
 			_ = atomicWrite(configPath, original, 0644)
-			_ = exec.Command("systemctl", "reload", "nginx").Run()
+			_, _ = run("systemctl", "reload", "nginx")
 		}
-		if output, err := exec.Command("nginx", "-t").CombinedOutput(); err != nil {
+		if output, err := run("nginx", "-t"); err != nil {
 			rollback()
 			_ = writeAudit("tls.remove.failed", false, domain+": "+tail(string(output), 800))
 			return status, fmt.Errorf("Nginx validation failed: %s", tail(string(output), 800))
 		}
-		if err := exec.Command("systemctl", "reload", "nginx").Run(); err != nil {
+		if err := mustRun("systemctl", "reload", "nginx"); err != nil {
 			rollback()
 			return status, err
 		}
 	}
 	// Delete certificate material only after the web server stopped referencing
 	// it, so a rollback above never points at missing files.
-	if output, err := exec.Command("certbot", "delete", "--cert-name", domain, "--non-interactive").CombinedOutput(); err != nil {
+	if output, err := runLong("certbot", "delete", "--cert-name", domain, "--non-interactive"); err != nil {
 		_ = writeAudit("tls.remove.failed", false, domain+": "+tail(string(output), 800))
 		return inspectTLS(domain), fmt.Errorf("HTTPS was disabled, but Certbot could not delete the certificate: %s", tail(string(output), 800))
 	}
@@ -2334,7 +2701,7 @@ var dnsSessionPattern = regexp.MustCompile(`^[a-f0-9]{32}$`)
 // certbotMajorVersion parses `certbot --version` ("certbot 0.40.0"). It
 // returns 2 when detection fails so modern flag behavior is the default.
 func certbotMajorVersion() int {
-	output, err := exec.Command("certbot", "--version").CombinedOutput()
+	output, err := runLong("certbot", "--version")
 	if err != nil {
 		return 2
 	}
@@ -2470,7 +2837,8 @@ func issueTLSDNS(domain, email, session string, force bool) (tlsStatus, error) {
 		// flag was removed in certbot 2.0 and would be rejected there.
 		arguments = append(arguments, "--manual-public-ip-logging-ok")
 	}
-	command := exec.Command("certbot", arguments...)
+	command, cancelCommand7 := commandContext(longTimeout, "certbot", arguments...)
+	defer cancelCommand7()
 	var output bytes.Buffer
 	command.Stdout = &output
 	command.Stderr = &output
@@ -2571,18 +2939,21 @@ func createDatabase(name, username string) (database, error) {
 	}
 	if engine == "PostgreSQL" {
 		roleSQL := fmt.Sprintf("CREATE ROLE %s LOGIN PASSWORD '%s'", username, password)
-		if output, err := exec.Command("runuser", "-u", "postgres", "--", "psql", "--set", "ON_ERROR_STOP=1", "--command", roleSQL).CombinedOutput(); err != nil {
+		// Read from stdin so the password never appears in the process list.
+		if output, err := runWithStdin(defaultTimeout, roleSQL, "runuser", "-u", "postgres", "--", "psql", "--set", "ON_ERROR_STOP=1", "--file", "-"); err != nil {
 			_ = writeAudit("database.create.failed", false, name+": "+tail(string(output), 500))
 			return value, fmt.Errorf("PostgreSQL rejected role creation: %s", tail(string(output), 500))
 		}
-		if output, err := exec.Command("runuser", "-u", "postgres", "--", "createdb", "--owner", username, name).CombinedOutput(); err != nil {
-			_ = exec.Command("runuser", "-u", "postgres", "--", "dropuser", "--if-exists", username).Run()
+		if output, err := run("runuser", "-u", "postgres", "--", "createdb", "--owner", username, name); err != nil {
+			_, _ = run("runuser", "-u", "postgres", "--", "dropuser", "--if-exists", username)
 			_ = writeAudit("database.create.failed", false, name+": "+tail(string(output), 500))
 			return value, fmt.Errorf("PostgreSQL rejected database creation: %s", tail(string(output), 500))
 		}
 	} else {
 		sql := fmt.Sprintf("CREATE DATABASE `%s` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; CREATE USER '%s'@'localhost' IDENTIFIED BY '%s'; GRANT ALL PRIVILEGES ON `%s`.* TO '%s'@'localhost'; FLUSH PRIVILEGES;", name, username, password, name, username)
-		if output, err := exec.Command(databaseClient, "--batch", "--skip-column-names", "--execute", sql).CombinedOutput(); err != nil {
+		// Through stdin, not --execute: an argument holding the password would be
+		// readable in /proc by any local user, www-data included. See runWithStdin.
+		if output, err := runWithStdin(defaultTimeout, sql, databaseClient, "--batch", "--skip-column-names"); err != nil {
 			_ = writeAudit("database.create.failed", false, name+": "+tail(string(output), 500))
 			return value, fmt.Errorf("%s rejected database creation: %s", engine, tail(string(output), 500))
 		}
@@ -2593,11 +2964,11 @@ func createDatabase(name, username string) (database, error) {
 	encoded, _ := json.MarshalIndent(metadataValue, "", "  ")
 	if err := atomicWrite(metadataPath, append(encoded, '\n'), 0644); err != nil {
 		if engine == "PostgreSQL" {
-			_ = exec.Command("runuser", "-u", "postgres", "--", "dropdb", "--if-exists", name).Run()
-			_ = exec.Command("runuser", "-u", "postgres", "--", "dropuser", "--if-exists", username).Run()
+			_, _ = run("runuser", "-u", "postgres", "--", "dropdb", "--if-exists", name)
+			_, _ = run("runuser", "-u", "postgres", "--", "dropuser", "--if-exists", username)
 		} else {
 			cleanup := fmt.Sprintf("DROP DATABASE IF EXISTS `%s`; DROP USER IF EXISTS '%s'@'localhost';", name, username)
-			_ = exec.Command(databaseClient, "--execute", cleanup).Run()
+			_, _ = run(databaseClient, "--execute", cleanup)
 		}
 		return database{}, err
 	}
@@ -2619,7 +2990,7 @@ func randomPassword(length int) (string, error) {
 }
 
 func packageVersion(name string) string {
-	output, err := exec.Command("dpkg-query", "-W", "-f=${Status}\t${Version}", name).Output()
+	output, err := runOutputWithTimeout(defaultTimeout, "dpkg-query", "-W", "-f=${Status}\t${Version}", name)
 	if err != nil {
 		return ""
 	}
@@ -2751,13 +3122,13 @@ func inspectContainers() (containerInventory, error) {
 	if !result.Installed {
 		return result, nil
 	}
-	if output, err := exec.Command("docker", "version", "--format", "{{.Server.Version}}").Output(); err == nil {
+	if output, err := runOutputWithTimeout(defaultTimeout, "docker", "version", "--format", "{{.Server.Version}}"); err == nil {
 		result.Version = strings.TrimSpace(string(output))
 	}
 	if !result.Active {
 		return result, nil
 	}
-	output, err := exec.Command("docker", "ps", "-a", "--no-trunc", "--format", "{{json .}}").CombinedOutput()
+	output, err := run("docker", "ps", "-a", "--no-trunc", "--format", "{{json .}}")
 	if err != nil {
 		return result, fmt.Errorf("list containers: %s", tail(string(output), 800))
 	}
@@ -2779,13 +3150,14 @@ func installContainerRuntime() (containerInventory, error) {
 	if os.Geteuid() != 0 {
 		return containerInventory{}, errors.New("container-install must run as root")
 	}
-	command := exec.Command("apt-get", "install", "-y", "--no-install-recommends", "docker.io")
+	command, cancelCommand8 := commandContext(longTimeout, "apt-get", "install", "-y", "--no-install-recommends", "docker.io")
+	defer cancelCommand8()
 	command.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
 	output, err := command.CombinedOutput()
 	if err != nil {
 		return containerInventory{}, fmt.Errorf("install Docker: %s", tail(string(output), 1200))
 	}
-	if output, err := exec.Command("systemctl", "enable", "--now", "docker").CombinedOutput(); err != nil {
+	if output, err := run("systemctl", "enable", "--now", "docker"); err != nil {
 		return containerInventory{}, fmt.Errorf("start Docker: %s", tail(string(output), 800))
 	}
 	_ = writeAudit("container.runtime.installed", true, "docker.io")
@@ -2805,7 +3177,7 @@ func controlContainerEncoded(encodedName, action string) (containerInventory, er
 	if action != "start" && action != "stop" && action != "restart" {
 		return containerInventory{}, errors.New("unsupported container action")
 	}
-	output, err := exec.Command("docker", action, "--", name).CombinedOutput()
+	output, err := run("docker", action, "--", name)
 	if err != nil {
 		return containerInventory{}, fmt.Errorf("%s container: %s", action, tail(string(output), 800))
 	}
@@ -2826,7 +3198,7 @@ func containerLogsEncoded(encodedName, encodedLines string) (containerLogs, erro
 	if err != nil || lines < 20 || lines > 1000 {
 		return containerLogs{}, errors.New("log line count must be between 20 and 1000")
 	}
-	output, err := exec.Command("docker", "logs", "--tail", strconv.Itoa(lines), "--", name).CombinedOutput()
+	output, err := run("docker", "logs", "--tail", strconv.Itoa(lines), "--", name)
 	if err != nil {
 		return containerLogs{}, fmt.Errorf("read container logs: %s", tail(string(output), 800))
 	}
@@ -3002,7 +3374,7 @@ func writeManagedFileEncoded(domain, path, encodedContent string) (fileContents,
 	if target == root {
 		return fileContents{}, errors.New("the website root cannot be overwritten")
 	}
-	if err := atomicWrite(target, content, 0644); err != nil {
+	if err := replaceManagedFile(root, target, content); err != nil {
 		return fileContents{}, err
 	}
 	_ = writeAudit("file.updated", true, target)
@@ -3038,14 +3410,9 @@ func deleteManagedFileEncoded(domain, path, permanentStr string) ([]managedFile,
 		}
 		_ = writeAudit("file.deleted_permanently", true, target)
 	} else {
-		trashDir := filepath.Join(root, ".trash")
-		if err := os.MkdirAll(trashDir, 0755); err != nil {
+		trashDir, err := managedTrashDirectory(root)
+		if err != nil {
 			return nil, err
-		}
-		if stat, err := os.Stat(root); err == nil {
-			if sysStat, ok := stat.Sys().(*syscall.Stat_t); ok {
-				_ = os.Chown(trashDir, int(sysStat.Uid), int(sysStat.Gid))
-			}
 		}
 
 		timestamp := time.Now().UnixNano()
@@ -3072,12 +3439,7 @@ func deleteManagedFileEncoded(domain, path, permanentStr string) ([]managedFile,
 		})
 
 		if data, err := json.MarshalIndent(manifest, "", "  "); err == nil {
-			_ = atomicWrite(manifestPath, append(data, '\n'), 0644)
-			if stat, err := os.Stat(trashDir); err == nil {
-				if sysStat, ok := stat.Sys().(*syscall.Stat_t); ok {
-					_ = os.Chown(manifestPath, int(sysStat.Uid), int(sysStat.Gid))
-				}
-			}
+			_ = atomicWrite(manifestPath, append(data, '\n'), 0600)
 		}
 		_ = writeAudit("file.trashed", true, target)
 	}
@@ -3094,7 +3456,11 @@ func listTrashedFilesEncoded(domain string) ([]trashEntry, error) {
 	if err != nil {
 		return nil, err
 	}
-	manifestPath := filepath.Join(root, ".trash", "manifest.json")
+	trashDir, err := managedTrashDirectory(root)
+	if err != nil {
+		return nil, err
+	}
+	manifestPath := filepath.Join(trashDir, "manifest.json")
 	var manifest []trashEntry
 	if bytes, err := os.ReadFile(manifestPath); err == nil {
 		_ = json.Unmarshal(bytes, &manifest)
@@ -3116,7 +3482,10 @@ func restoreTrashedFileEncoded(domain, trashName string) ([]trashEntry, error) {
 	if err != nil {
 		return nil, err
 	}
-	trashDir := filepath.Join(root, ".trash")
+	trashDir, err := managedTrashDirectory(root)
+	if err != nil {
+		return nil, err
+	}
 	manifestPath := filepath.Join(trashDir, "manifest.json")
 
 	var manifest []trashEntry
@@ -3139,9 +3508,15 @@ func restoreTrashedFileEncoded(domain, trashName string) ([]trashEntry, error) {
 	if foundIdx == -1 {
 		return nil, errors.New("item not found in trash")
 	}
+	if !validTrashName(decodedTrashName) {
+		return nil, errors.New("trash entry has an unsafe name")
+	}
 
 	trashPath := filepath.Join(trashDir, decodedTrashName)
-	originalPath := filepath.Join(root, entry.OriginalPath)
+	originalPath, err := managedRestoreTarget(root, entry.OriginalPath)
+	if err != nil {
+		return nil, err
+	}
 
 	if _, err := os.Stat(originalPath); err == nil {
 		return nil, fmt.Errorf("an item already exists at original location: %s", entry.OriginalPath)
@@ -3157,7 +3532,7 @@ func restoreTrashedFileEncoded(domain, trashName string) ([]trashEntry, error) {
 
 	manifest = append(manifest[:foundIdx], manifest[foundIdx+1:]...)
 	if data, err := json.MarshalIndent(manifest, "", "  "); err == nil {
-		_ = atomicWrite(manifestPath, append(data, '\n'), 0644)
+		_ = atomicWrite(manifestPath, append(data, '\n'), 0600)
 	}
 	_ = writeAudit("file.restored", true, originalPath)
 
@@ -3172,7 +3547,10 @@ func emptyTrashEncoded(domain string) ([]trashEntry, error) {
 	if err != nil {
 		return nil, err
 	}
-	trashDir := filepath.Join(root, ".trash")
+	trashDir, err := managedTrashDirectory(root)
+	if err != nil {
+		return nil, err
+	}
 	if _, err := os.Stat(trashDir); err != nil {
 		return []trashEntry{}, nil
 	}
@@ -3185,13 +3563,7 @@ func emptyTrashEncoded(domain string) ([]trashEntry, error) {
 	}
 
 	manifestPath := filepath.Join(trashDir, "manifest.json")
-	_ = atomicWrite(manifestPath, []byte("[]\n"), 0644)
-
-	if stat, err := os.Stat(trashDir); err == nil {
-		if sysStat, ok := stat.Sys().(*syscall.Stat_t); ok {
-			_ = os.Chown(manifestPath, int(sysStat.Uid), int(sysStat.Gid))
-		}
-	}
+	_ = atomicWrite(manifestPath, []byte("[]\n"), 0600)
 
 	_ = writeAudit("file.trash_emptied", true, trashDir)
 	return []trashEntry{}, nil
@@ -3274,7 +3646,10 @@ func chmodManagedFileEncoded(domain, path, encodedMode string) ([]managedFile, e
 	if target == root {
 		return nil, errors.New("the website root permissions cannot be modified")
 	}
-	if err := os.Chmod(target, os.FileMode(modeVal)); err != nil {
+	if modeVal > 0777 {
+		return nil, errors.New("permission mode must be between 0000 and 0777")
+	}
+	if err := chmodManagedTarget(root, target, os.FileMode(modeVal)); err != nil {
 		return nil, err
 	}
 	_ = writeAudit("file.chmod", true, target)
@@ -3333,7 +3708,7 @@ func chownManagedFileEncoded(domain, path, encodedOwner, encodedGroup string) ([
 		}
 	}
 
-	if err := os.Chown(target, uid, gid); err != nil {
+	if err := chownManagedTarget(root, target, uid, gid); err != nil {
 		return nil, err
 	}
 	_ = writeAudit("file.chown", true, target)
@@ -3347,22 +3722,22 @@ func chownManagedFileEncoded(domain, path, encodedOwner, encodedGroup string) ([
 }
 
 func configureMailFoundation() error {
-	_, _ = exec.Command("groupadd", "-g", "5000", "vmail").CombinedOutput()
-	_, _ = exec.Command("useradd", "-g", "vmail", "-u", "5000", "vmail", "-d", "/var/mail/vhosts", "-m", "-s", "/usr/sbin/nologin").CombinedOutput()
+	_, _ = run("groupadd", "-g", "5000", "vmail")
+	_, _ = run("useradd", "-g", "vmail", "-u", "5000", "vmail", "-d", "/var/mail/vhosts", "-m", "-s", "/usr/sbin/nologin")
 
 	_ = os.MkdirAll("/var/mail/vhosts", 0770)
-	_ = exec.Command("chown", "-R", "vmail:vmail", "/var/mail/vhosts").Run()
+	_, _ = run("chown", "-R", "vmail:vmail", "/var/mail/vhosts")
 
 	for _, file := range []string{"/etc/postfix/vhosts", "/etc/postfix/vmaps", "/etc/postfix/virtual", "/etc/dovecot/users"} {
 		if _, err := os.Stat(file); os.IsNotExist(err) {
 			_ = os.WriteFile(file, []byte(""), 0600)
 		}
 	}
-	_ = exec.Command("chown", "root:root", "/etc/postfix/vhosts", "/etc/postfix/vmaps", "/etc/postfix/virtual").Run()
+	_, _ = run("chown", "root:root", "/etc/postfix/vhosts", "/etc/postfix/vmaps", "/etc/postfix/virtual")
 	_ = os.Chmod("/etc/postfix/vhosts", 0600)
 	_ = os.Chmod("/etc/postfix/vmaps", 0600)
 	_ = os.Chmod("/etc/postfix/virtual", 0600)
-	_ = exec.Command("chown", "dovecot:dovecot", "/etc/dovecot/users").Run()
+	_, _ = run("chown", "dovecot:dovecot", "/etc/dovecot/users")
 	_ = os.Chmod("/etc/dovecot/users", 0600)
 
 	postfixSettings := []string{
@@ -3376,7 +3751,7 @@ func configureMailFoundation() error {
 		"smtpd_recipient_restrictions = permit_mynetworks, permit_sasl_authenticated, reject_unauth_destination",
 	}
 	for _, setting := range postfixSettings {
-		_ = exec.Command("postconf", "-e", setting).Run()
+		_, _ = run("postconf", "-e", setting)
 	}
 
 	mailConf := "mail_location = maildir:/var/mail/vhosts/%d/%n\nnamespace inbox {\n  inbox = yes\n}\n"
@@ -3391,9 +3766,9 @@ func configureMailFoundation() error {
 	masterConf := "service lmtp {\n  unix_listener private/dovecot-lmtp {\n    mode = 0660\n    group = postfix\n    user = postfix\n  }\n}\nservice auth {\n  unix_listener private/auth {\n    mode = 0660\n    user = postfix\n    group = postfix\n  }\n}\n"
 	_ = os.WriteFile("/etc/dovecot/conf.d/10-master.conf", []byte(masterConf), 0644)
 
-	_ = exec.Command("postmap", "/etc/postfix/vhosts").Run()
-	_ = exec.Command("postmap", "/etc/postfix/vmaps").Run()
-	_ = exec.Command("postmap", "/etc/postfix/virtual").Run()
+	_, _ = run("postmap", "/etc/postfix/vhosts")
+	_, _ = run("postmap", "/etc/postfix/vmaps")
+	_, _ = run("postmap", "/etc/postfix/virtual")
 	return nil
 }
 
@@ -3405,7 +3780,8 @@ func installMailStack() (mailStatus, error) {
 	if err != nil || strings.TrimSpace(hostname) == "" {
 		return mailStatus{}, errors.New("the server hostname is not configured")
 	}
-	command := exec.Command("apt-get", "install", "-y", "--no-install-recommends", "postfix", "dovecot-core", "dovecot-imapd", "dovecot-lmtpd")
+	command, cancelCommand9 := commandContext(longTimeout, "apt-get", "install", "-y", "--no-install-recommends", "postfix", "dovecot-core", "dovecot-imapd", "dovecot-lmtpd")
+	defer cancelCommand9()
 	command.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
 	output, err := command.CombinedOutput()
 	if err != nil {
@@ -3417,7 +3793,7 @@ func installMailStack() (mailStatus, error) {
 	}
 
 	for _, unit := range []string{"postfix", "dovecot"} {
-		if output, err := exec.Command("systemctl", "enable", "--now", unit).CombinedOutput(); err != nil {
+		if output, err := run("systemctl", "enable", "--now", unit); err != nil {
 			return mailStatus{}, fmt.Errorf("start %s: %s", unit, tail(string(output), 800))
 		}
 	}
@@ -3444,7 +3820,8 @@ func prepareDKIM(domain string) (dkimMaterial, error) {
 			return result, errors.New("an existing unmanaged OpenDKIM configuration was found; ServerDeck will not overwrite it")
 		}
 	} else {
-		command := exec.Command("apt-get", "install", "-y", "--no-install-recommends", "opendkim", "opendkim-tools")
+		command, cancelCommand10 := commandContext(longTimeout, "apt-get", "install", "-y", "--no-install-recommends", "opendkim", "opendkim-tools")
+		defer cancelCommand10()
 		command.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
 		if output, installErr := command.CombinedOutput(); installErr != nil {
 			return result, fmt.Errorf("install OpenDKIM: %s", tail(string(output), 1200))
@@ -3457,19 +3834,19 @@ func prepareDKIM(domain string) (dkimMaterial, error) {
 	privateKey := filepath.Join(keyDir, "mail.private")
 	publicRecord := filepath.Join(keyDir, "mail.txt")
 	if _, err := os.Stat(privateKey); os.IsNotExist(err) {
-		if output, keyErr := exec.Command("opendkim-genkey", "-b", "2048", "-D", keyDir, "-d", domain, "-s", "mail").CombinedOutput(); keyErr != nil {
+		if output, keyErr := run("opendkim-genkey", "-b", "2048", "-D", keyDir, "-d", domain, "-s", "mail"); keyErr != nil {
 			return result, fmt.Errorf("generate DKIM key: %s", tail(string(output), 800))
 		}
 	}
 	_ = os.Chmod(privateKey, 0600)
-	if output, err := exec.Command("chown", "-R", "opendkim:opendkim", keyDir).CombinedOutput(); err != nil {
+	if output, err := run("chown", "-R", "opendkim:opendkim", keyDir); err != nil {
 		return result, fmt.Errorf("protect DKIM keys: %s", tail(string(output), 500))
 	}
 	socketDir := "/var/spool/postfix/opendkim"
 	if err := os.MkdirAll(socketDir, 0750); err != nil {
 		return result, err
 	}
-	if output, err := exec.Command("chown", "opendkim:postfix", socketDir).CombinedOutput(); err != nil {
+	if output, err := run("chown", "opendkim:postfix", socketDir); err != nil {
 		return result, fmt.Errorf("prepare DKIM socket: %s", tail(string(output), 500))
 	}
 	config := "# Managed by ServerDeck\nSyslog yes\nUMask 007\nMode sv\nCanonicalization relaxed/simple\nSocket local:" + socketDir + "/opendkim.sock\nUserID opendkim\nKeyTable refile:/etc/opendkim/key.table\nSigningTable refile:/etc/opendkim/signing.table\nExternalIgnoreList refile:/etc/opendkim/trusted.hosts\nInternalHosts refile:/etc/opendkim/trusted.hosts\n"
@@ -3490,28 +3867,28 @@ func prepareDKIM(domain string) (dkimMaterial, error) {
 		return result, err
 	}
 	for _, setting := range []string{"milter_default_action=accept", "milter_protocol=6", "smtpd_milters=unix:opendkim/opendkim.sock", "non_smtpd_milters=unix:opendkim/opendkim.sock"} {
-		if output, setErr := exec.Command("postconf", "-e", setting).CombinedOutput(); setErr != nil {
+		if output, setErr := run("postconf", "-e", setting); setErr != nil {
 			_ = atomicWrite("/etc/postfix/main.cf", mainCF, 0644)
 			return result, fmt.Errorf("configure Postfix DKIM: %s", tail(string(output), 500))
 		}
 	}
 	rollback := func() {
 		_ = atomicWrite("/etc/postfix/main.cf", mainCF, 0644)
-		_ = exec.Command("systemctl", "restart", "postfix").Run()
+		_, _ = run("systemctl", "restart", "postfix")
 	}
-	if output, err := exec.Command("opendkim", "-n", "-x", "/etc/opendkim.conf").CombinedOutput(); err != nil {
+	if output, err := run("opendkim", "-n", "-x", "/etc/opendkim.conf"); err != nil {
 		rollback()
 		return result, fmt.Errorf("validate OpenDKIM: %s", tail(string(output), 800))
 	}
-	if output, err := exec.Command("postfix", "check").CombinedOutput(); err != nil {
+	if output, err := run("postfix", "check"); err != nil {
 		rollback()
 		return result, fmt.Errorf("validate Postfix: %s", tail(string(output), 800))
 	}
-	if output, err := exec.Command("systemctl", "enable", "--now", "opendkim").CombinedOutput(); err != nil {
+	if output, err := run("systemctl", "enable", "--now", "opendkim"); err != nil {
 		rollback()
 		return result, fmt.Errorf("start OpenDKIM: %s", tail(string(output), 800))
 	}
-	if output, err := exec.Command("systemctl", "restart", "postfix").CombinedOutput(); err != nil {
+	if output, err := runLong("systemctl", "restart", "postfix"); err != nil {
 		rollback()
 		return result, fmt.Errorf("restart Postfix: %s", tail(string(output), 800))
 	}
@@ -3584,14 +3961,14 @@ func issueMailTLS(domain, email string) (mailTLSStatus, error) {
 			return result, err
 		}
 	}
-	if output, err := exec.Command("nginx", "-t").CombinedOutput(); err != nil {
+	if output, err := run("nginx", "-t"); err != nil {
 		return result, fmt.Errorf("validate mail challenge: %s", tail(string(output), 800))
 	}
-	if err := exec.Command("systemctl", "reload", "nginx").Run(); err != nil {
+	if err := mustRun("systemctl", "reload", "nginx"); err != nil {
 		return result, err
 	}
 	arguments := []string{"certonly", "--webroot", "--webroot-path", challengeRoot, "--non-interactive", "--agree-tos", "--keep-until-expiring", "--email", email, "--domain", hostname}
-	if output, err := exec.Command("certbot", arguments...).CombinedOutput(); err != nil {
+	if output, err := runLong("certbot", arguments...); err != nil {
 		return result, fmt.Errorf("issue mail certificate: %s", tail(string(output), 1200))
 	}
 	certificateDir := filepath.Join("/etc/letsencrypt/live", hostname)
@@ -3612,16 +3989,16 @@ func issueMailTLS(domain, email string) (mailTLSStatus, error) {
 		} else {
 			_ = os.Remove(dovecotPath)
 		}
-		_ = exec.Command("systemctl", "restart", "postfix").Run()
-		_ = exec.Command("systemctl", "restart", "dovecot").Run()
+		_, _ = run("systemctl", "restart", "postfix")
+		_, _ = run("systemctl", "restart", "dovecot")
 	}
 	for _, setting := range []string{"myhostname=" + hostname, "mydomain=" + domain, "myorigin=$mydomain", "smtpd_tls_cert_file=" + certificate, "smtpd_tls_key_file=" + privateKey, "smtpd_tls_security_level=may", "smtp_tls_security_level=may", "smtpd_tls_auth_only=yes"} {
-		if output, setErr := exec.Command("postconf", "-e", setting).CombinedOutput(); setErr != nil {
+		if output, setErr := run("postconf", "-e", setting); setErr != nil {
 			rollback()
 			return result, fmt.Errorf("configure Postfix TLS: %s", tail(string(output), 800))
 		}
 	}
-	versionOutput, _ := exec.Command("dovecot", "--version").Output()
+	versionOutput, _ := runOutputWithTimeout(defaultTimeout, "dovecot", "--version")
 	dovecotConfig := "# Managed by ServerDeck\nssl = required\n"
 	if strings.HasPrefix(strings.TrimSpace(string(versionOutput)), "2.4") {
 		dovecotConfig += "ssl_server_cert_file = " + certificate + "\nssl_server_key_file = " + privateKey + "\n"
@@ -3632,19 +4009,19 @@ func issueMailTLS(domain, email string) (mailTLSStatus, error) {
 		rollback()
 		return result, err
 	}
-	if output, err := exec.Command("postfix", "check").CombinedOutput(); err != nil {
+	if output, err := run("postfix", "check"); err != nil {
 		rollback()
 		return result, fmt.Errorf("validate Postfix TLS: %s", tail(string(output), 800))
 	}
-	if output, err := exec.Command("doveconf", "-n").CombinedOutput(); err != nil {
+	if output, err := run("doveconf", "-n"); err != nil {
 		rollback()
 		return result, fmt.Errorf("validate Dovecot TLS: %s", tail(string(output), 1000))
 	}
-	if output, err := exec.Command("systemctl", "restart", "postfix").CombinedOutput(); err != nil {
+	if output, err := runLong("systemctl", "restart", "postfix"); err != nil {
 		rollback()
 		return result, fmt.Errorf("restart Postfix: %s", tail(string(output), 800))
 	}
-	if output, err := exec.Command("systemctl", "restart", "dovecot").CombinedOutput(); err != nil {
+	if output, err := runLong("systemctl", "restart", "dovecot"); err != nil {
 		rollback()
 		return result, fmt.Errorf("restart Dovecot: %s", tail(string(output), 800))
 	}
@@ -3668,14 +4045,18 @@ func checkMailDNS(domain string) (mailDNSCheck, error) {
 		return result, err
 	}
 	publicIP := detected["address"]
+	addressRecordType := "AAAA"
+	if parsed := net.ParseIP(publicIP); parsed != nil && parsed.To4() != nil {
+		addressRecordType = "A"
+	}
 	addresses, _ := net.LookupIP(hostname)
-	aPresent := false
+	addressPresent := false
 	for _, address := range addresses {
 		if address.String() == publicIP {
-			aPresent = true
+			addressPresent = true
 		}
 	}
-	result.Records = append(result.Records, dnsRequirement{Type: "A", Name: hostname, Value: publicIP, Present: aPresent, Note: "Must be DNS-only, not proxied"})
+	result.Records = append(result.Records, dnsRequirement{Type: addressRecordType, Name: hostname, Value: publicIP, Present: addressPresent, Note: "Must be DNS-only, not proxied"})
 	matchesMX := false
 	if values, lookupErr := net.LookupMX(domain); lookupErr == nil {
 		for _, value := range values {
@@ -3736,7 +4117,7 @@ func checkMailDNS(domain string) (mailDNSCheck, error) {
 }
 
 func packageCandidate(name string) string {
-	output, _ := exec.Command("apt-cache", "policy", name).Output()
+	output, _ := runOutputWithTimeout(defaultTimeout, "apt-cache", "policy", name)
 	for _, line := range strings.Split(string(output), "\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "Candidate:") {
@@ -3750,13 +4131,32 @@ func packageCandidate(name string) string {
 }
 
 func unitActive(name string) bool {
-	return exec.Command("systemctl", "is-active", "--quiet", name).Run() == nil
+	// Called for every service on every refresh, so it takes the short deadline.
+	_, err := runQuick("systemctl", "is-active", "--quiet", name)
+	return err == nil
+}
+
+// softwareCatalogPackageNames lists every package the catalogue can display,
+// so an update check can price them all in a single apt-cache call.
+func softwareCatalogPackageNames() []string {
+	names := []string{"docker-ce"}
+	catalog, err := listSoftware()
+	if err != nil {
+		return names
+	}
+	for index := range catalog {
+		names = append(names, catalog[index].Package)
+	}
+	return names
 }
 
 func listSoftware() ([]softwarePackage, error) {
 	dockerPackage := "docker.io"
 	dockerDescription := "Ubuntu-maintained container runtime"
-	if packageCandidate("docker-ce") != "" {
+	// Whether Docker's own repository is available was previously answered with
+	// an apt-cache call on every refresh. The cached candidate list answers it
+	// for free; before the first update check we simply show the Ubuntu package.
+	if readCandidateCache()["docker-ce"] != "" {
 		dockerPackage = "docker-ce"
 		dockerDescription = "Docker Engine from Docker's official repository"
 	}
@@ -3778,10 +4178,22 @@ func listSoftware() ([]softwarePackage, error) {
 		{ID: "git", Name: "Git", Category: "Utilities", Package: "git", Description: "Source control client"},
 	}
 	units := map[string]string{"nginx": "nginx", "apache2": "apache2", "mariadb": "mariadb", "mysql": "mysql", "postgresql": "postgresql", "redis": "redis-server", "vsftpd": "vsftpd", "docker": "docker", "postfix": "postfix", "dovecot": "dovecot", "fail2ban": "fail2ban", "ufw": "ufw"}
+	// Installed versions come from dpkg, which is local and cheap. Candidate
+	// versions would need apt, which loads its whole cache (~77 MB peak on a
+	// small instance), so they are read from the cache written by the last
+	// explicit update check. Nothing here may trigger apt: this runs on every
+	// refresh, and doing so is what previously exhausted memory on 1 GB hosts.
+	names := make([]string, 0, len(catalog))
 	for index := range catalog {
-		catalog[index].Version = packageVersion(catalog[index].Package)
+		names = append(names, catalog[index].Package)
+	}
+	versions := packageVersions(names)
+	candidates := readCandidateCache()
+
+	for index := range catalog {
+		catalog[index].Version = versions[catalog[index].Package]
 		catalog[index].Installed = catalog[index].Version != ""
-		catalog[index].Candidate = packageCandidate(catalog[index].Package)
+		catalog[index].Candidate = candidates[catalog[index].Package]
 		if unit, ok := units[catalog[index].ID]; ok {
 			catalog[index].Active = unitActive(unit)
 		}
@@ -3904,20 +4316,19 @@ func packageSourceCatalog() ([]sourceCatalogItem, error) {
 		}
 		return false
 	}
-	phpSupported := codename == "jammy" || codename == "noble"
-	dockerSupported := codename == "jammy" || codename == "noble" || codename == "questing" || codename == "resolute"
-	phpReason := ""
-	if !phpSupported {
-		phpReason = "Available only for currently supported Ubuntu LTS releases (22.04 and 24.04)"
-	}
+	// Offered unless the release is known to be past support. An allowlist of
+	// codenames was blocking every release newer than the ones it named, which is
+	// backwards: a newer Ubuntu is more likely to be carried by these
+	// repositories, not less. If one genuinely has no packages for a release,
+	// enabling it fails and is rolled back — a far better outcome than refusing
+	// to try on a release that works.
+	dockerSupported := !isEndOfLifeUbuntu(codename)
 	dockerReason := ""
 	if !dockerSupported {
-		dockerReason = "Docker does not list this Ubuntu release as supported"
+		dockerReason = "This Ubuntu release is past its support window, so Docker no longer publishes packages for it."
 	}
 	return []sourceCatalogItem{
-		{ID: "ondrej-php", Name: "PHP versions by Ondřej Surý", Description: "Co-installable PHP versions for current Ubuntu LTS releases", Supported: phpSupported, Enabled: hasURI("ppa.launchpadcontent.net/ondrej/php"), Reason: phpReason},
 		{ID: "docker", Name: "Docker official", Description: "Docker Engine, Compose, Buildx, and containerd packages", Supported: dockerSupported, Enabled: hasURI("download.docker.com/linux/ubuntu"), Reason: dockerReason},
-		{ID: "nodesource", Name: "NodeSource", Description: "Additional Node.js release lines", Supported: false, Enabled: hasURI("deb.nodesource.com"), Reason: "Temporarily unavailable while upstream signing and repository reliability issues are reviewed"},
 	}, nil
 }
 
@@ -3926,10 +4337,10 @@ func enablePackageSource(id string) ([]sourceCatalogItem, error) {
 		return nil, errors.New("source-enable must run as root")
 	}
 	codename := ubuntuCodename()
-	if output, err := exec.Command("apt-get", "update").CombinedOutput(); err != nil {
+	if output, err := runLong("apt-get", "-o", "DPkg::Lock::Timeout=30", "update"); err != nil {
 		return nil, fmt.Errorf("refresh package information: %s", tail(string(output), 800))
 	}
-	if output, err := exec.Command("apt-get", "install", "-y", "--no-install-recommends", "ca-certificates", "gnupg").CombinedOutput(); err != nil {
+	if output, err := runLong("apt-get", "-o", "DPkg::Lock::Timeout=30", "install", "-y", "--no-install-recommends", "ca-certificates", "gnupg"); err != nil {
 		return nil, fmt.Errorf("install repository prerequisites: %s", tail(string(output), 800))
 	}
 	if err := os.MkdirAll("/etc/apt/keyrings", 0755); err != nil {
@@ -3942,43 +4353,8 @@ func enablePackageSource(id string) ([]sourceCatalogItem, error) {
 		}
 	}
 	switch id {
-	case "ondrej-php":
-		if codename != "jammy" && codename != "noble" {
-			return nil, errors.New("the PHP PPA supports Ubuntu 22.04 and 24.04 only")
-		}
-		keyData, err := downloadRepositoryFile("https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xB8DC7E53946656EFBCE4C1DD71DAEAAB4AD4CAB6")
-		if err != nil {
-			return nil, err
-		}
-		temporary, err := os.CreateTemp("", "serverdeck-php-key-*")
-		if err != nil {
-			return nil, err
-		}
-		temporaryPath := temporary.Name()
-		defer os.Remove(temporaryPath)
-		if _, err = temporary.Write(keyData); err != nil {
-			temporary.Close()
-			return nil, err
-		}
-		temporary.Close()
-		fingerprints, err := exec.Command("gpg", "--batch", "--show-keys", "--with-colons", temporaryPath).Output()
-		if err != nil || !strings.Contains(string(fingerprints), "B8DC7E53946656EFBCE4C1DD71DAEAAB4AD4CAB6") {
-			return nil, errors.New("PHP repository signing key fingerprint did not match the verified fingerprint")
-		}
-		keyPath := "/etc/apt/keyrings/serverdeck-ondrej-php.gpg"
-		if output, err := exec.Command("gpg", "--batch", "--yes", "--dearmor", "--output", keyPath, temporaryPath).CombinedOutput(); err != nil {
-			return nil, fmt.Errorf("store PHP repository key: %s", tail(string(output), 800))
-		}
-		created = append(created, keyPath)
-		sourcePath := "/etc/apt/sources.list.d/serverdeck-ondrej-php.sources"
-		source := fmt.Sprintf("Types: deb\nURIs: https://ppa.launchpadcontent.net/ondrej/php/ubuntu\nSuites: %s\nComponents: main\nSigned-By: %s\n", codename, keyPath)
-		if err := atomicWrite(sourcePath, []byte(source), 0644); err != nil {
-			rollback()
-			return nil, err
-		}
-		created = append(created, sourcePath)
 	case "docker":
-		allowed := codename == "jammy" || codename == "noble" || codename == "questing" || codename == "resolute"
+		allowed := repositoryPublishesSuite(curatedSourceBaseURLs["docker"], codename)
 		if !allowed {
 			return nil, errors.New("Docker does not list this Ubuntu release as supported")
 		}
@@ -3991,7 +4367,7 @@ func enablePackageSource(id string) ([]sourceCatalogItem, error) {
 			return nil, err
 		}
 		created = append(created, keyPath)
-		architectureData, architectureErr := exec.Command("dpkg", "--print-architecture").Output()
+		architectureData, architectureErr := runOutputWithTimeout(defaultTimeout, "dpkg", "--print-architecture")
 		if architectureErr != nil {
 			rollback()
 			return nil, errors.New("could not determine package architecture")
@@ -4007,7 +4383,7 @@ func enablePackageSource(id string) ([]sourceCatalogItem, error) {
 	default:
 		return nil, errors.New("source is not available in the verified ServerDeck catalog")
 	}
-	if output, err := exec.Command("apt-get", "update").CombinedOutput(); err != nil {
+	if output, err := runLong("apt-get", "-o", "DPkg::Lock::Timeout=30", "update"); err != nil {
 		rollback()
 		return nil, fmt.Errorf("verify repository: %s", tail(string(output), 1000))
 	}
@@ -4096,17 +4472,17 @@ func installCatalogSoftware(id string) ([]softwarePackage, error) {
 	if err := writeAudit("software.install.started", true, id); err != nil {
 		return nil, err
 	}
-	if output, err := exec.Command("apt-get", "update").CombinedOutput(); err != nil {
+	if output, err := runLong("apt-get", "-o", "DPkg::Lock::Timeout=30", "update"); err != nil {
 		_ = writeAudit("software.install.failed", false, id+": "+tail(string(output), 800))
 		return nil, fmt.Errorf("refresh package information: %s", tail(string(output), 800))
 	}
 	arguments := append([]string{"install", "-y", "--no-install-recommends"}, selection.packages...)
-	if output, err := exec.Command("apt-get", arguments...).CombinedOutput(); err != nil {
+	if output, err := runLong("apt-get", append([]string{"-o", "DPkg::Lock::Timeout=30"}, arguments...)...); err != nil {
 		_ = writeAudit("software.install.failed", false, id+": "+tail(string(output), 800))
 		return nil, fmt.Errorf("install %s: %s", id, tail(string(output), 800))
 	}
 	if selection.unit != "" {
-		if output, err := exec.Command("systemctl", "enable", "--now", selection.unit).CombinedOutput(); err != nil {
+		if output, err := run("systemctl", "enable", "--now", selection.unit); err != nil {
 			_ = writeAudit("software.install.failed", false, id+": "+tail(string(output), 800))
 			return nil, fmt.Errorf("enable %s: %s", selection.unit, tail(string(output), 800))
 		}
@@ -4205,7 +4581,7 @@ func removeCatalogSoftware(id string) ([]softwarePackage, error) {
 	}
 	_ = writeAudit("software.remove.started", true, id)
 	arguments := append([]string{"remove", "-y"}, selection...)
-	if output, err := exec.Command("apt-get", arguments...).CombinedOutput(); err != nil {
+	if output, err := runLong("apt-get", append([]string{"-o", "DPkg::Lock::Timeout=30"}, arguments...)...); err != nil {
 		_ = writeAudit("software.remove.failed", false, id+": "+tail(string(output), 800))
 		return nil, fmt.Errorf("remove %s: %s", id, tail(string(output), 800))
 	}
@@ -4265,11 +4641,11 @@ func installPHPVersion(version string) ([]phpVersionStatus, error) {
 	}
 	packages := []string{base + "-fpm", base + "-cli", base + "-common", base + "-curl", base + "-mbstring", base + "-mysql", base + "-xml", base + "-zip", base + "-opcache"}
 	arguments := append([]string{"install", "-y", "--no-install-recommends"}, packages...)
-	output, err := exec.Command("apt-get", arguments...).CombinedOutput()
+	output, err := runLong("apt-get", append([]string{"-o", "DPkg::Lock::Timeout=30"}, arguments...)...)
 	if err != nil {
 		return nil, fmt.Errorf("install PHP %s: %s", version, tail(string(output), 1200))
 	}
-	if err := exec.Command("systemctl", "enable", "--now", base+"-fpm").Run(); err != nil {
+	if err := mustRun("systemctl", "enable", "--now", base+"-fpm"); err != nil {
 		return nil, fmt.Errorf("start PHP %s FPM: %w", version, err)
 	}
 	_ = writeAudit("software.php.installed", true, version)
@@ -4308,7 +4684,7 @@ func removePHPVersion(version string) ([]phpVersionStatus, error) {
 		return listPHPVersions()
 	}
 	arguments := append([]string{"remove", "-y"}, packages...)
-	output, err := exec.Command("apt-get", arguments...).CombinedOutput()
+	output, err := runLong("apt-get", append([]string{"-o", "DPkg::Lock::Timeout=30"}, arguments...)...)
 	if err != nil {
 		return nil, fmt.Errorf("remove PHP %s: %s", version, tail(string(output), 1200))
 	}
@@ -4338,11 +4714,11 @@ func setPHPExtension(version, extension, action string) ([]phpVersionStatus, err
 	if action == "install" && packageCandidate(packageName) == "" {
 		return nil, errors.New("this extension is not available from the configured repositories")
 	}
-	output, err := exec.Command("apt-get", action, "-y", "--no-install-recommends", packageName).CombinedOutput()
+	output, err := run("apt-get", "-o", "DPkg::Lock::Timeout=30", action, "-y", "--no-install-recommends", packageName)
 	if err != nil {
 		return nil, fmt.Errorf("%s %s: %s", action, packageName, tail(string(output), 1200))
 	}
-	if err := exec.Command("systemctl", "restart", base+"-fpm").Run(); err != nil {
+	if err := mustRun("systemctl", "restart", base+"-fpm"); err != nil {
 		return nil, fmt.Errorf("restart PHP %s FPM: %w", version, err)
 	}
 	_ = writeAudit("software.php.extension."+action, true, version+" "+extension)
@@ -4357,7 +4733,7 @@ func listRuntimes() (runtimes, error) {
 		version := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(socket), "php"), "-fpm.sock")
 		result.PHP = append(result.PHP, phpRuntime{Version: version, Socket: socket, Active: true})
 	}
-	if output, err := exec.Command("node", "--version").Output(); err == nil {
+	if output, err := runOutputWithTimeout(defaultTimeout, "node", "--version"); err == nil {
 		result.Node = append(result.Node, strings.TrimPrefix(strings.TrimSpace(string(output)), "v"))
 	}
 	return result, nil
@@ -4408,17 +4784,20 @@ func switchPHP(domain, version string) (site, error) {
 	}
 	rollback := func() {
 		_ = atomicWrite(configPath, original, 0644)
-		_ = exec.Command("systemctl", "reload", map[string]string{"nginx": "nginx", "apache": "apache2"}[webServer]).Run()
+		_, _ = run("systemctl", "reload", map[string]string{"nginx": "nginx", "apache": "apache2"}[webServer])
 	}
-	validation := exec.Command("nginx", "-t")
+	validation, cancelValidation := commandContext(defaultTimeout, "nginx", "-t")
+	defer cancelValidation()
 	if webServer == "apache" {
-		validation = exec.Command("apache2ctl", "configtest")
+		validation2, cancelValidation2 := commandContext(defaultTimeout, "apache2ctl", "configtest")
+		validation = validation2
+		defer cancelValidation2()
 	}
 	if output, err := validation.CombinedOutput(); err != nil {
 		rollback()
 		return value, fmt.Errorf("%s validation failed: %s", webServer, tail(string(output), 800))
 	}
-	if err := exec.Command("systemctl", "reload", map[string]string{"nginx": "nginx", "apache": "apache2"}[webServer]).Run(); err != nil {
+	if err := mustRun("systemctl", "reload", map[string]string{"nginx": "nginx", "apache": "apache2"}[webServer]); err != nil {
 		rollback()
 		return value, err
 	}
@@ -4436,10 +4815,10 @@ func installNode() (map[string]interface{}, error) {
 	if os.Geteuid() != 0 {
 		return nil, errors.New("node-install must run as root")
 	}
-	if output, err := exec.Command("apt-get", "install", "-y", "--no-install-recommends", "nodejs", "npm").CombinedOutput(); err != nil {
+	if output, err := runLong("apt-get", "-o", "DPkg::Lock::Timeout=30", "install", "-y", "--no-install-recommends", "nodejs", "npm"); err != nil {
 		return nil, fmt.Errorf("Node.js installation failed: %s", tail(string(output), 800))
 	}
-	version, _ := exec.Command("node", "--version").Output()
+	version, _ := runOutputWithTimeout(defaultTimeout, "node", "--version")
 	_ = writeAudit("runtime.node.installed", true, strings.TrimSpace(string(version)))
 	return map[string]interface{}{"version": strings.TrimPrefix(strings.TrimSpace(string(version)), "v")}, nil
 }
@@ -4475,15 +4854,15 @@ func createNodeProject(domain string) (site, error) {
 	if err := os.MkdirAll(root, 0750); err != nil {
 		return value, err
 	}
-	if err := exec.Command("useradd", "--system", "--home", root, "--shell", "/usr/sbin/nologin", user).Run(); err != nil {
+	if err := mustRun("useradd", "--system", "--home", root, "--shell", "/usr/sbin/nologin", user); err != nil {
 		return value, fmt.Errorf("create service user: %w", err)
 	}
 	serverJS := fmt.Sprintf("const http=require('http');const port=process.env.PORT||%d;http.createServer((req,res)=>res.end('<h1>%s</h1><p>Node.js managed by ServerDeck.</p>')).listen(port,'127.0.0.1');\n", port, domain)
 	if err := os.WriteFile(filepath.Join(root, "server.js"), []byte(serverJS), 0640); err != nil {
 		return value, err
 	}
-	_ = exec.Command("chown", "-R", user+":"+user, filepath.Dir(root)).Run()
-	versionOutput, _ := exec.Command("node", "--version").Output()
+	_, _ = run("chown", "-R", user+":"+user, filepath.Dir(root))
+	versionOutput, _ := runOutputWithTimeout(defaultTimeout, "node", "--version")
 	nodeVersion := strings.TrimPrefix(strings.TrimSpace(string(versionOutput)), "v")
 	unit := fmt.Sprintf("[Unit]\nDescription=ServerDeck Node project %s\nAfter=network.target\n\n[Service]\nUser=%s\nGroup=%s\nWorkingDirectory=%s\nEnvironment=PORT=%d\nExecStart=/usr/bin/node server.js\nRestart=on-failure\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\nReadWritePaths=%s\n\n[Install]\nWantedBy=multi-user.target\n", domain, user, user, root, port, root)
 	unitPath := filepath.Join("/etc/systemd/system", serviceName+".service")
@@ -4493,7 +4872,7 @@ func createNodeProject(domain string) (site, error) {
 	config := fmt.Sprintf("server {\n listen 80;\n listen [::]:80;\n server_name %s;\n location / {\n  proxy_pass http://127.0.0.1:%d;\n  proxy_set_header Host $host;\n  proxy_set_header X-Real-IP $remote_addr;\n  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n  proxy_set_header X-Forwarded-Proto $scheme;\n }\n}\n", domain, port)
 	configPath, enabledPath := filepath.Join("/etc/nginx/sites-available", domain), filepath.Join("/etc/nginx/sites-enabled", domain)
 	if webServer == "apache" {
-		if output, err := exec.Command("a2enmod", "proxy", "proxy_http", "headers").CombinedOutput(); err != nil {
+		if output, err := run("a2enmod", "proxy", "proxy_http", "headers"); err != nil {
 			return value, fmt.Errorf("enable Apache proxy modules: %s", tail(string(output), 800))
 		}
 		config = fmt.Sprintf("<VirtualHost *:80>\n ServerName %s\n ProxyPreserveHost On\n ProxyPass / http://127.0.0.1:%d/\n ProxyPassReverse / http://127.0.0.1:%d/\n RequestHeader set X-Forwarded-Proto expr=%%{REQUEST_SCHEME}\n</VirtualHost>\n", domain, port, port)
@@ -4507,21 +4886,24 @@ func createNodeProject(domain string) (site, error) {
 		if err := os.Symlink(configPath, enabledPath); err != nil {
 			return value, err
 		}
-	} else if output, err := exec.Command("a2ensite", domain+".conf").CombinedOutput(); err != nil {
+	} else if output, err := run("a2ensite", domain+".conf"); err != nil {
 		return value, fmt.Errorf("enable Apache site: %s", tail(string(output), 800))
 	}
-	_ = exec.Command("systemctl", "daemon-reload").Run()
-	if output, err := exec.Command("systemctl", "enable", "--now", serviceName).CombinedOutput(); err != nil {
+	_, _ = run("systemctl", "daemon-reload")
+	if output, err := run("systemctl", "enable", "--now", serviceName); err != nil {
 		return value, fmt.Errorf("start project: %s", tail(string(output), 800))
 	}
-	validation := exec.Command("nginx", "-t")
+	validation, cancelValidation3 := commandContext(defaultTimeout, "nginx", "-t")
+	defer cancelValidation3()
 	if webServer == "apache" {
-		validation = exec.Command("apache2ctl", "configtest")
+		validation2, cancelValidation4 := commandContext(defaultTimeout, "apache2ctl", "configtest")
+		validation = validation2
+		defer cancelValidation4()
 	}
 	if output, err := validation.CombinedOutput(); err != nil {
 		return value, fmt.Errorf("%s validation failed: %s", webServer, tail(string(output), 800))
 	}
-	if err := exec.Command("systemctl", "reload", map[string]string{"nginx": "nginx", "apache": "apache2"}[webServer]).Run(); err != nil {
+	if err := mustRun("systemctl", "reload", map[string]string{"nginx": "nginx", "apache": "apache2"}[webServer]); err != nil {
 		return value, err
 	}
 	value = site{Domain: domain, Kind: "node", Root: root, Enabled: true, NodeVersion: nodeVersion, Service: serviceName, Port: port, CreatedAt: time.Now().UTC().Format(time.RFC3339), WebServer: webServer}
@@ -4560,7 +4942,47 @@ func listSites() ([]site, error) {
 	return sites, nil
 }
 
+// createSite builds a site with the default canonical host preference.
 func createSite(domain, kind string) (site, error) {
+	return createSiteWithCanonical(domain, kind, canonicalNonWWW)
+}
+
+// createSiteWithDatabase creates a site and, optionally, a database bound to it.
+//
+// Creating the two together is what makes the association reliable. A database
+// made separately has nothing tying it to a site, so backups cannot know to
+// include it — the site gets archived as files only, which cannot restore it.
+func createSiteWithDatabase(domain, kind string, canonical canonicalHost, withDatabase bool) (site, error) {
+	value, err := createSiteWithCanonical(domain, kind, canonical)
+	if err != nil || !withDatabase {
+		return value, err
+	}
+
+	name := databaseNameForDomain(domain)
+	user := name
+	if len(user) > 32 {
+		user = user[:32]
+	}
+	created, err := createDatabase(name, user)
+	if err != nil {
+		// The site is left in place: it is serving, and tearing it down because
+		// a database could not be made would be the more destructive answer. The
+		// caller reports the failure so the user can add one afterwards.
+		return value, fmt.Errorf("the website was created, but its database was not: %w", err)
+	}
+
+	value.Database = created.Name
+	value.DatabaseUser = created.Username
+	if err := writeSiteMetadata(value); err != nil {
+		return value, fmt.Errorf("the website and database were created, but the link between them was not saved: %w", err)
+	}
+	// Returned once, like every other generated credential, because the stored
+	// record deliberately never keeps it.
+	value.DatabasePassword = created.Password
+	return value, nil
+}
+
+func createSiteWithCanonical(domain, kind string, canonical canonicalHost) (site, error) {
 	value := site{}
 	if os.Geteuid() != 0 {
 		return value, errors.New("site-create must run as root")
@@ -4614,7 +5036,7 @@ func createSite(domain, kind string) (site, error) {
     }
 `, socket)
 		} else {
-			if output, err := exec.Command("a2enmod", "proxy_fcgi", "setenvif", "rewrite").CombinedOutput(); err != nil {
+			if output, err := run("a2enmod", "proxy_fcgi", "setenvif", "rewrite"); err != nil {
 				return value, fmt.Errorf("enable Apache PHP modules: %s", tail(string(output), 800))
 			}
 			phpBlock = fmt.Sprintf("    <FilesMatch \"\\.php$\">\n        SetHandler \"proxy:unix:%s|fcgi://localhost/\"\n    </FilesMatch>\n", socket)
@@ -4629,23 +5051,54 @@ func createSite(domain, kind string) (site, error) {
 			// applications with pretty URLs work without manual edits.
 			fallback = "/index.php?$args"
 		}
-		config = fmt.Sprintf(`server {
+		// A www alias belongs on a registrable domain only; see domains.go.
+		// When there is one, it gets its own server block that redirects to the
+		// canonical host, so the two names never serve duplicate content.
+		redirectBlock := ""
+		serving := serverNames(domain)
+		if from, to, ok := canonicalRedirect(domain, canonical); ok {
+			redirectBlock = fmt.Sprintf(`server {
     listen 80;
     listen [::]:80;
-    server_name %s www.%s;
+    server_name %s;
+    return 301 $scheme://%s$request_uri;
+}
+
+`, from, to)
+			serving = []string{to}
+		}
+		config = redirectBlock + fmt.Sprintf(`server {
+    listen 80;
+    listen [::]:80;
+    server_name %s;
     root %s;
     index index.html;
 
+%s
     location / {
         try_files $uri $uri/ %s;
     }
 %s}
-`, domain, domain, root, fallback, phpBlock)
+`, strings.Join(serving, " "), root, nginxSecurityHeaders, fallback, phpBlock)
 	} else {
-		config = fmt.Sprintf(`<VirtualHost *:80>
+		// Apache keeps the primary name and its aliases separate, so the alias
+		// line is omitted entirely rather than left empty.
+		aliasLine := ""
+		if alias, ok := wwwAliasFor(domain); ok {
+			aliasLine = fmt.Sprintf("    ServerAlias %s\n", alias)
+		}
+		primary := normaliseHost(domain)
+		redirectBlock := ""
+		if from, to, ok := canonicalRedirect(domain, canonical); ok {
+			// The non-canonical name becomes its own vhost that redirects, so the
+			// serving vhost answers on exactly one host.
+			redirectBlock = fmt.Sprintf("<VirtualHost *:80>\n    ServerName %s\n    Redirect permanent / http://%s/\n</VirtualHost>\n\n", from, to)
+			primary = to
+			aliasLine = ""
+		}
+		config = redirectBlock + fmt.Sprintf(`<VirtualHost *:80>
     ServerName %s
-    ServerAlias www.%s
-    DocumentRoot %s
+%s    DocumentRoot %s
     <Directory %s>
         Options FollowSymLinks
         AllowOverride All
@@ -4653,7 +5106,7 @@ func createSite(domain, kind string) (site, error) {
         DirectoryIndex index.php index.html
     </Directory>
 %s</VirtualHost>
-`, domain, domain, root, root, phpBlock)
+`, primary, aliasLine, root, root, phpBlock)
 	}
 
 	if err := os.MkdirAll(root, 0755); err != nil {
@@ -4676,13 +5129,16 @@ func createSite(domain, kind string) (site, error) {
 			_ = os.Remove(configPath)
 			return value, fmt.Errorf("enable site: %w", err)
 		}
-	} else if output, err := exec.Command("a2ensite", domain+".conf").CombinedOutput(); err != nil {
+	} else if output, err := run("a2ensite", domain+".conf"); err != nil {
 		_ = os.Remove(configPath)
 		return value, fmt.Errorf("enable Apache site: %s", tail(string(output), 800))
 	}
-	validation := exec.Command("nginx", "-t")
+	validation, cancelValidation5 := commandContext(defaultTimeout, "nginx", "-t")
+	defer cancelValidation5()
 	if webServer == "apache" {
-		validation = exec.Command("apache2ctl", "configtest")
+		validation2, cancelValidation6 := commandContext(defaultTimeout, "apache2ctl", "configtest")
+		validation = validation2
+		defer cancelValidation6()
 	}
 	if output, err := validation.CombinedOutput(); err != nil {
 		_ = os.Remove(enabledPath)
@@ -4698,7 +5154,7 @@ func createSite(domain, kind string) (site, error) {
 		_ = os.Remove(configPath)
 		return site{}, err
 	}
-	if output, err := exec.Command("systemctl", "reload", map[string]string{"nginx": "nginx", "apache": "apache2"}[webServer]).CombinedOutput(); err != nil {
+	if output, err := runLong("systemctl", "reload", map[string]string{"nginx": "nginx", "apache": "apache2"}[webServer]); err != nil {
 		_ = os.Remove(metadataPath)
 		_ = os.Remove(enabledPath)
 		_ = os.Remove(configPath)
@@ -4772,17 +5228,17 @@ func migrateWebServer(target string) (webMigrationPlan, error) {
 	created := []string{}
 	metadataOriginals := map[string][]byte{}
 	rollback := func(detail string) {
-		_ = exec.Command("systemctl", "stop", targetUnit).Run()
+		_, _ = run("systemctl", "stop", targetUnit)
 		for _, path := range created {
 			_ = os.Remove(path)
 		}
 		for path, contents := range metadataOriginals {
 			_ = atomicWrite(path, contents, 0644)
 		}
-		_ = exec.Command("systemctl", "start", sourceUnit).Run()
+		_, _ = run("systemctl", "start", sourceUnit)
 		_ = writeAudit("web.migration.rolled-back", false, detail+" safety "+safety.ID)
 	}
-	if err := exec.Command("systemctl", "stop", sourceUnit).Run(); err != nil {
+	if err := mustRun("systemctl", "stop", sourceUnit); err != nil {
 		return plan, fmt.Errorf("stop %s before migration: %w", plan.Source, err)
 	}
 	packages := []string{"nginx", "certbot", "python3-certbot-nginx"}
@@ -4790,12 +5246,12 @@ func migrateWebServer(target string) (webMigrationPlan, error) {
 		packages = []string{"apache2", "certbot", "python3-certbot-apache"}
 	}
 	arguments := append([]string{"install", "-y", "--no-install-recommends"}, packages...)
-	if output, installErr := exec.Command("apt-get", arguments...).CombinedOutput(); installErr != nil {
+	if output, installErr := runLong("apt-get", append([]string{"-o", "DPkg::Lock::Timeout=30"}, arguments...)...); installErr != nil {
 		rollback("install target: " + tail(string(output), 800))
 		return plan, fmt.Errorf("install %s: %s", target, tail(string(output), 800))
 	}
 	if target == "apache" {
-		if output, moduleErr := exec.Command("a2enmod", "proxy", "proxy_http", "proxy_fcgi", "setenvif", "rewrite", "headers", "ssl").CombinedOutput(); moduleErr != nil {
+		if output, moduleErr := run("a2enmod", "proxy", "proxy_http", "proxy_fcgi", "setenvif", "rewrite", "headers", "ssl"); moduleErr != nil {
 			rollback("enable Apache modules: " + tail(string(output), 800))
 			return plan, fmt.Errorf("enable Apache modules: %s", tail(string(output), 800))
 		}
@@ -4828,15 +5284,18 @@ func migrateWebServer(target string) (webMigrationPlan, error) {
 		}
 		created = append(created, enabledPath)
 	}
-	validation := exec.Command("nginx", "-t")
+	validation, cancelValidation7 := commandContext(defaultTimeout, "nginx", "-t")
+	defer cancelValidation7()
 	if target == "apache" {
-		validation = exec.Command("apache2ctl", "configtest")
+		validation2, cancelValidation8 := commandContext(defaultTimeout, "apache2ctl", "configtest")
+		validation = validation2
+		defer cancelValidation8()
 	}
 	if output, validationErr := validation.CombinedOutput(); validationErr != nil {
 		rollback("validation: " + tail(string(output), 1000))
 		return plan, fmt.Errorf("%s validation failed: %s", target, tail(string(output), 1000))
 	}
-	if output, startErr := exec.Command("systemctl", "enable", "--now", targetUnit).CombinedOutput(); startErr != nil {
+	if output, startErr := run("systemctl", "enable", "--now", targetUnit); startErr != nil {
 		rollback("start target: " + tail(string(output), 800))
 		return plan, fmt.Errorf("start %s: %s", target, tail(string(output), 800))
 	}
@@ -4868,7 +5327,7 @@ func renderSiteForWebServer(item site, target string) (string, error) {
 			listenTLS = fmt.Sprintf("    listen 443 ssl;\n    listen [::]:443 ssl;\n    ssl_certificate %s/fullchain.pem;\n    ssl_certificate_key %s/privkey.pem;\n", certificatePath, certificatePath)
 		}
 		if item.Kind == "node" || item.Kind == "proxy" {
-			return fmt.Sprintf("server {\n    listen 80;\n    listen [::]:80;\n%s    server_name %s;\n    location / {\n        proxy_pass http://127.0.0.1:%d;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n    }\n}\n", listenTLS, item.Domain, item.Port), nil
+			return fmt.Sprintf("server {\n    listen 80;\n    listen [::]:80;\n%s    server_name %s;\n    location / {\n        proxy_pass http://127.0.0.1:%d;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n    }\n}\n", listenTLS, strings.Join(serverNames(item.Domain), " "), item.Port), nil
 		}
 		phpBlock := ""
 		if item.Kind == "php" {
@@ -4882,7 +5341,7 @@ func renderSiteForWebServer(item site, target string) (string, error) {
 		if item.Kind == "php" {
 			fallback = "/index.php?$args"
 		}
-		return fmt.Sprintf("server {\n    listen 80;\n    listen [::]:80;\n%s    server_name %s;\n    root %s;\n    index index.php index.html;\n    location / { try_files $uri $uri/ %s; }\n%s}\n", listenTLS, item.Domain, item.Root, fallback, phpBlock), nil
+		return fmt.Sprintf("server {\n    listen 80;\n    listen [::]:80;\n%s    server_name %s;\n    root %s;\n    index index.php index.html;\n    location / { try_files $uri $uri/ %s; }\n%s}\n", listenTLS, strings.Join(serverNames(item.Domain), " "), item.Root, fallback, phpBlock), nil
 	}
 	if target != "apache" {
 		return "", errors.New("unsupported migration target")
@@ -4900,9 +5359,13 @@ func renderSiteForWebServer(item site, target string) (string, error) {
 			body += fmt.Sprintf("    <FilesMatch \"\\.php$\">\n        SetHandler \"proxy:unix:%s|fcgi://localhost/\"\n    </FilesMatch>\n", socket)
 		}
 	}
-	config := fmt.Sprintf("<VirtualHost *:80>\n    ServerName %s\n%s</VirtualHost>\n", item.Domain, body)
+	aliasLine := ""
+	if alias, ok := wwwAliasFor(item.Domain); ok {
+		aliasLine = fmt.Sprintf("    ServerAlias %s\n", alias)
+	}
+	config := fmt.Sprintf("<VirtualHost *:80>\n    ServerName %s\n%s%s</VirtualHost>\n", normaliseHost(item.Domain), aliasLine, body)
 	if tls {
-		config += fmt.Sprintf("<VirtualHost *:443>\n    ServerName %s\n    SSLEngine on\n    SSLCertificateFile %s/fullchain.pem\n    SSLCertificateKeyFile %s/privkey.pem\n%s</VirtualHost>\n", item.Domain, certificatePath, certificatePath, body)
+		config += fmt.Sprintf("<VirtualHost *:443>\n    ServerName %s\n%s    SSLEngine on\n    SSLCertificateFile %s/fullchain.pem\n    SSLCertificateKeyFile %s/privkey.pem\n%s</VirtualHost>\n", normaliseHost(item.Domain), aliasLine, certificatePath, certificatePath, body)
 	}
 	return config, nil
 }
@@ -5065,7 +5528,7 @@ func installWebStack(webServer, database string, php, node, redis, ftp, fail2ban
 		if err := atomicWrite("/etc/fail2ban/jail.d/serverdeck.local", []byte(configuration), 0644); err != nil {
 			return nil, err
 		}
-		if output, err := exec.Command("systemctl", "enable", "--now", "fail2ban").CombinedOutput(); err != nil {
+		if output, err := run("systemctl", "enable", "--now", "fail2ban"); err != nil {
 			emitProgress("security", "failed", "Could not enable Fail2ban")
 			return nil, fmt.Errorf("enable Fail2ban: %s", tail(string(output), 800))
 		}
@@ -5092,7 +5555,8 @@ func emitProgress(phase, status, message string) {
 }
 
 func runProgressCommand(name string, arguments ...string) ([]byte, error) {
-	command := exec.Command(name, arguments...)
+	command, cancelCommand11 := commandContext(defaultTimeout, name, arguments...)
+	defer cancelCommand11()
 	var output bytes.Buffer
 	writer := io.MultiWriter(os.Stderr, &output)
 	command.Stdout = writer
@@ -5172,11 +5636,12 @@ type appInstallResult struct {
 }
 
 type appDownload struct {
-	url          string
-	checksumURL  string
-	githubRepo   string
-	assetPattern string
-	format       string
+	url            string
+	checksumURL    string
+	expectedSHA256 string
+	githubRepo     string
+	assetPattern   string
+	format         string
 }
 
 type appDefinition struct {
@@ -5204,7 +5669,7 @@ func appDefinitions() []appDefinition {
 			website:     "https://wordpress.org",
 			database:    "mysql",
 			extensions:  []string{"mysql", "curl", "gd", "intl", "mbstring", "xml", "zip"},
-			download:    appDownload{url: "https://wordpress.org/latest.tar.gz", format: "tar.gz"},
+			download:    appDownload{url: "https://wordpress.org/wordpress-7.0.2.tar.gz", expectedSHA256: "d4a4d219dea64c6c68e62f2ffc3f331c5475510246d6c44f61fb52f377d295b9", format: "tar.gz"},
 			notes:       "The database connection is pre-configured. Open the site to choose a language and create the administrator account.",
 			configure:   configureWordPress,
 		},
@@ -5279,7 +5744,7 @@ func appDefinitions() []appDefinition {
 			website:        "https://matomo.org",
 			database:       "mysql",
 			extensions:     []string{"mysql", "curl", "gd", "mbstring", "xml", "zip"},
-			download:       appDownload{url: "https://builds.matomo.org/matomo-latest.tar.gz", format: "tar.gz"},
+			download:       appDownload{url: "https://builds.matomo.org/matomo-5.12.0.tar.gz", expectedSHA256: "ca24145dbf721a027c3c538bd6dc97b57126802be26aa0ad3740f0c4a706655d", format: "tar.gz"},
 			archiveSubPath: "matomo",
 			notes:          "Open the site and finish the Matomo installer with the database credentials shown after installation.",
 		},
@@ -5324,6 +5789,10 @@ func findAppDefinition(id string) (appDefinition, error) {
 		}
 	}
 	return appDefinition{}, errors.New("unknown application ID")
+}
+
+func appDownloadVerifiable(definition appDefinition) bool {
+	return definition.download.checksumURL != "" || definition.download.expectedSHA256 != "" || definition.download.githubRepo != ""
 }
 
 func detectActiveWebServer() string {
@@ -5409,6 +5878,9 @@ func appCatalog() (appCatalogReport, error) {
 		case definition.database == "any" && len(report.Engines) == 0:
 			entry.Supported = false
 			entry.Reason = "A managed database server must be installed"
+		case !appDownloadVerifiable(definition):
+			entry.Supported = false
+			entry.Reason = "The publisher does not provide a checksum ServerDeck can verify"
 		}
 		report.Apps = append(report.Apps, entry)
 	}
@@ -5453,46 +5925,51 @@ func databaseIdentifier(appID, domain string) string {
 	return strings.TrimRight(name, "_")
 }
 
-func resolveGitHubDownload(repo, pattern string) (string, string, error) {
+func resolveGitHubDownload(repo, pattern string) (string, string, string, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
 	request, err := http.NewRequest(http.MethodGet, "https://api.github.com/repos/"+repo+"/releases/latest", nil)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	request.Header.Set("User-Agent", "ServerDeck-Agent/"+version)
 	request.Header.Set("Accept", "application/vnd.github+json")
 	response, err := client.Do(request)
 	if err != nil {
-		return "", "", fmt.Errorf("query latest release: %w", err)
+		return "", "", "", fmt.Errorf("query latest release: %w", err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return "", "", fmt.Errorf("query latest release: HTTP %d", response.StatusCode)
+		return "", "", "", fmt.Errorf("query latest release: HTTP %d", response.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(response.Body, 4*1024*1024))
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	var release struct {
 		TagName string `json:"tag_name"`
 		Assets  []struct {
 			Name               string `json:"name"`
 			BrowserDownloadURL string `json:"browser_download_url"`
+			Digest             string `json:"digest"`
 		} `json:"assets"`
 	}
 	if err := json.Unmarshal(body, &release); err != nil {
-		return "", "", fmt.Errorf("decode release: %w", err)
+		return "", "", "", fmt.Errorf("decode release: %w", err)
 	}
 	matcher, err := regexp.Compile(pattern)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	for _, asset := range release.Assets {
 		if matcher.MatchString(asset.Name) {
-			return asset.BrowserDownloadURL, strings.TrimPrefix(release.TagName, "v"), nil
+			digest := strings.TrimPrefix(strings.ToLower(asset.Digest), "sha256:")
+			if !regexp.MustCompile(`^[a-f0-9]{64}$`).MatchString(digest) {
+				return "", "", "", errors.New("the GitHub release asset does not publish a SHA-256 digest")
+			}
+			return asset.BrowserDownloadURL, strings.TrimPrefix(release.TagName, "v"), digest, nil
 		}
 	}
-	return "", "", errors.New("the latest release does not contain the expected package")
+	return "", "", "", errors.New("the latest release does not contain the expected package")
 }
 
 func fetchExpectedChecksum(address string) (string, error) {
@@ -5552,24 +6029,6 @@ func downloadAppArchive(address, destination string) (int64, string, error) {
 	return written, fmt.Sprintf("%x", digest.Sum(nil)), nil
 }
 
-func extractAppArchive(archivePath, format, staging string) error {
-	var command *exec.Cmd
-	switch format {
-	case "tar.gz":
-		command = exec.Command("tar", "--no-same-owner", "-xzf", archivePath, "-C", staging)
-	case "tar.bz2":
-		command = exec.Command("tar", "--no-same-owner", "-xjf", archivePath, "-C", staging)
-	case "zip":
-		command = exec.Command("unzip", "-q", archivePath, "-d", staging)
-	default:
-		return errors.New("unsupported archive format")
-	}
-	if output, err := command.CombinedOutput(); err != nil {
-		return fmt.Errorf("extract application: %s", tail(string(output), 800))
-	}
-	return nil
-}
-
 // resolveArchiveRoot descends through a single wrapping directory (for
 // archives like wordpress/ or drupal-11.x/) and then applies the catalog's
 // explicit sub-path when one is defined.
@@ -5611,21 +6070,11 @@ func ensurePHPExtensions(phpVersion string, extensions []string) error {
 		return nil
 	}
 	arguments := append([]string{"install", "-y", "--no-install-recommends"}, missing...)
-	if output, err := exec.Command("apt-get", arguments...).CombinedOutput(); err != nil {
+	if output, err := runLong("apt-get", append([]string{"-o", "DPkg::Lock::Timeout=30"}, arguments...)...); err != nil {
 		return fmt.Errorf("install PHP extensions: %s", tail(string(output), 1200))
 	}
-	if err := exec.Command("systemctl", "restart", "php"+phpVersion+"-fpm").Run(); err != nil {
+	if err := mustRun("systemctl", "restart", "php"+phpVersion+"-fpm"); err != nil {
 		return fmt.Errorf("restart PHP %s FPM: %w", phpVersion, err)
-	}
-	return nil
-}
-
-func ensureUnzip() error {
-	if _, err := exec.LookPath("unzip"); err == nil {
-		return nil
-	}
-	if output, err := exec.Command("apt-get", "install", "-y", "--no-install-recommends", "unzip").CombinedOutput(); err != nil {
-		return fmt.Errorf("install unzip: %s", tail(string(output), 800))
 	}
 	return nil
 }
@@ -5643,20 +6092,20 @@ func removeCreatedSite(domain, webServer string) {
 	_ = os.Remove(configPath)
 	_ = os.Remove(filepath.Join("/var/lib/serverdeck/sites", domain+".json"))
 	_ = os.RemoveAll(filepath.Join("/var/www", domain))
-	_ = exec.Command("systemctl", "reload", reloadUnit).Run()
+	_, _ = run("systemctl", "reload", reloadUnit)
 }
 
 func removeCreatedDatabase(value database) {
 	if value.Engine == "PostgreSQL" {
-		_ = exec.Command("runuser", "-u", "postgres", "--", "dropdb", "--if-exists", value.Name).Run()
-		_ = exec.Command("runuser", "-u", "postgres", "--", "dropuser", "--if-exists", value.Username).Run()
+		_, _ = run("runuser", "-u", "postgres", "--", "dropdb", "--if-exists", value.Name)
+		_, _ = run("runuser", "-u", "postgres", "--", "dropuser", "--if-exists", value.Username)
 	} else {
 		client := "mariadb"
 		if value.Engine == "MySQL" {
 			client = "mysql"
 		}
 		cleanup := fmt.Sprintf("DROP DATABASE IF EXISTS `%s`; DROP USER IF EXISTS '%s'@'localhost';", value.Name, value.Username)
-		_ = exec.Command(client, "--execute", cleanup).Run()
+		_, _ = run(client, "--execute", cleanup)
 	}
 	_ = os.Remove(filepath.Join("/var/lib/serverdeck/databases", value.Name+".json"))
 }
@@ -5669,6 +6118,9 @@ func installApp(appID, domain string, createDB bool) (appInstallResult, error) {
 	definition, err := findAppDefinition(appID)
 	if err != nil {
 		return result, err
+	}
+	if !appDownloadVerifiable(definition) {
+		return result, errors.New("this application cannot be installed because its publisher does not provide a verifiable checksum")
 	}
 	domain = strings.ToLower(strings.TrimSpace(domain))
 	if len(domain) > 253 || !domainPattern.MatchString(domain) {
@@ -5705,19 +6157,14 @@ func installApp(appID, domain string, createDB bool) (appInstallResult, error) {
 		emitProgress("extensions", "failed", err.Error())
 		return result, err
 	}
-	if definition.download.format == "zip" {
-		if err := ensureUnzip(); err != nil {
-			emitProgress("extensions", "failed", err.Error())
-			return result, err
-		}
-	}
 	emitProgress("extensions", "completed", "PHP extensions are ready")
 
 	downloadURL := definition.download.url
 	releaseVersion := ""
+	expectedChecksum := definition.download.expectedSHA256
 	if definition.download.githubRepo != "" {
 		emitProgress("download", "running", "Finding the latest "+definition.name+" release")
-		downloadURL, releaseVersion, err = resolveGitHubDownload(definition.download.githubRepo, definition.download.assetPattern)
+		downloadURL, releaseVersion, expectedChecksum, err = resolveGitHubDownload(definition.download.githubRepo, definition.download.assetPattern)
 		if err != nil {
 			emitProgress("download", "failed", err.Error())
 			return result, err
@@ -5741,13 +6188,16 @@ func installApp(appID, domain string, createDB bool) (appInstallResult, error) {
 			emitProgress("download", "failed", checksumErr.Error())
 			return result, checksumErr
 		}
-		if expected != actualChecksum {
+		expectedChecksum = expected
+	}
+	if expectedChecksum != "" {
+		if expectedChecksum != actualChecksum {
 			emitProgress("download", "failed", "The downloaded file did not match the published checksum")
 			return result, errors.New("the downloaded file did not match the published SHA-256 checksum")
 		}
 		emitProgress("download", "completed", fmt.Sprintf("Downloaded %.1f MB and verified the published checksum", float64(written)/1024/1024))
 	} else {
-		emitProgress("download", "completed", fmt.Sprintf("Downloaded %.1f MB over HTTPS from the official source", float64(written)/1024/1024))
+		return result, errors.New("this application cannot be installed because its publisher does not provide a verifiable checksum")
 	}
 
 	emitProgress("site", "running", "Creating the website "+domain)
@@ -5777,7 +6227,7 @@ func installApp(appID, domain string, createDB bool) (appInstallResult, error) {
 	}
 	_ = os.Remove(filepath.Join(siteValue.Root, "index.php"))
 	_ = os.Remove(filepath.Join(siteValue.Root, "index.html"))
-	if output, err := exec.Command("cp", "-a", sourceRoot+"/.", siteValue.Root+"/").CombinedOutput(); err != nil {
+	if output, err := run("cp", "-a", sourceRoot+"/.", siteValue.Root+"/"); err != nil {
 		emitProgress("files", "failed", tail(string(output), 800))
 		removeCreatedSite(domain, webServer)
 		return result, fmt.Errorf("copy application files: %s", tail(string(output), 800))
@@ -5812,7 +6262,7 @@ func installApp(appID, domain string, createDB bool) (appInstallResult, error) {
 	}
 
 	emitProgress("permissions", "running", "Setting file ownership for the web server")
-	if output, err := exec.Command("chown", "-R", "www-data:www-data", filepath.Join("/var/www", domain)).CombinedOutput(); err != nil {
+	if output, err := run("chown", "-R", "www-data:www-data", filepath.Join("/var/www", domain)); err != nil {
 		emitProgress("permissions", "failed", tail(string(output), 400))
 		if databaseValue != nil {
 			removeCreatedDatabase(*databaseValue)
@@ -5951,7 +6401,7 @@ func inspectServices() ([]service, error) {
 		}
 		services = append(services, s)
 	}
-	phpUnits, _ := exec.Command("systemctl", "list-unit-files", "php*-fpm.service", "--no-legend", "--no-pager").Output()
+	phpUnits, _ := runOutputWithTimeout(defaultTimeout, "systemctl", "list-unit-files", "php*-fpm.service", "--no-legend", "--no-pager")
 	for _, line := range strings.Split(string(phpUnits), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) == 0 {
@@ -6032,7 +6482,7 @@ func getServiceSystemdProperties(name string) (loadState, subState, activeEnter 
 }
 
 func systemctl(arguments ...string) string {
-	output, _ := exec.Command("systemctl", arguments...).Output()
+	output, _ := runOutputWithTimeout(defaultTimeout, "systemctl", arguments...)
 	return string(output)
 }
 
@@ -6136,9 +6586,13 @@ func writeSoftwareConfig(id, encodedContent string) (string, error) {
 
 	var testCmd *exec.Cmd
 	if id == "nginx" {
-		testCmd = exec.Command("nginx", "-t")
+		testCmd2, cancelTestcmd := commandContext(defaultTimeout, "nginx", "-t")
+		testCmd = testCmd2
+		defer cancelTestcmd()
 	} else if id == "apache" {
-		testCmd = exec.Command("apache2ctl", "configtest")
+		testCmd2, cancelTestcmd2 := commandContext(defaultTimeout, "apache2ctl", "configtest")
+		testCmd = testCmd2
+		defer cancelTestcmd2()
 	}
 
 	if testCmd != nil {
@@ -6181,7 +6635,7 @@ func writeSoftwareConfig(id, encodedContent string) (string, error) {
 	}
 
 	if serviceName != "" {
-		_ = exec.Command("systemctl", "restart", serviceName).Run()
+		_, _ = run("systemctl", "restart", serviceName)
 	}
 
 	_ = writeAudit("software.config_updated", true, path)
@@ -6214,19 +6668,23 @@ func deleteSite(domain string, deleteRoot bool) error {
 	_ = os.Remove(enabledPath)
 	_ = os.Remove(configPath)
 	_ = os.Remove(metadataPath)
+	// Drop any staging record so a deleted staging site cannot linger in the
+	// staging list pointing at a site that no longer exists.
+	removeStagingRecord(domain)
 
 	if deleteRoot {
 		parent := filepath.Dir(value.Root)
 		if strings.HasPrefix(parent, "/var/www/") && parent != "/var/www/" && parent != "/var/www" {
 			_ = os.RemoveAll(parent)
 		}
+		_ = os.RemoveAll(filepath.Join(managedTrashRoot, domain))
 	}
 
 	serviceName := "nginx"
 	if value.WebServer == "apache" {
 		serviceName = "apache2"
 	}
-	_ = exec.Command("systemctl", "reload", serviceName).Run()
+	_, _ = run("systemctl", "reload", serviceName)
 
 	_ = writeAudit("site.deleted", true, domain)
 	return nil
@@ -6271,9 +6729,13 @@ func updateSite(domain, newRoot, phpVersion string) error {
 
 		var testCmd *exec.Cmd
 		if value.WebServer == "nginx" {
-			testCmd = exec.Command("nginx", "-t")
+			testCmd2, cancelTestcmd3 := commandContext(defaultTimeout, "nginx", "-t")
+			testCmd = testCmd2
+			defer cancelTestcmd3()
 		} else {
-			testCmd = exec.Command("apache2ctl", "configtest")
+			testCmd2, cancelTestcmd4 := commandContext(defaultTimeout, "apache2ctl", "configtest")
+			testCmd = testCmd2
+			defer cancelTestcmd4()
 		}
 		if output, err := testCmd.CombinedOutput(); err != nil {
 			_ = atomicWrite(configPath, configBytes, 0644)
@@ -6299,7 +6761,7 @@ func updateSite(domain, newRoot, phpVersion string) error {
 	if value.WebServer == "apache" {
 		serviceName = "apache2"
 	}
-	_ = exec.Command("systemctl", "reload", serviceName).Run()
+	_, _ = run("systemctl", "reload", serviceName)
 
 	_ = writeAudit("site.updated", true, domain)
 	return nil
@@ -6322,15 +6784,15 @@ func deleteDatabase(name string) error {
 	}
 
 	if value.Engine == "PostgreSQL" {
-		_ = exec.Command("runuser", "-u", "postgres", "--", "dropdb", "--if-exists", name).Run()
-		_ = exec.Command("runuser", "-u", "postgres", "--", "dropuser", "--if-exists", value.Username).Run()
+		_, _ = run("runuser", "-u", "postgres", "--", "dropdb", "--if-exists", name)
+		_, _ = run("runuser", "-u", "postgres", "--", "dropuser", "--if-exists", value.Username)
 	} else {
 		databaseClient := "mariadb"
 		if packageVersion("mysql-server") != "" && packageVersion("mariadb-server") == "" {
 			databaseClient = "mysql"
 		}
 		sql := fmt.Sprintf("DROP DATABASE IF EXISTS `%s`; DROP USER IF EXISTS '%s'@'localhost';", name, value.Username)
-		_ = exec.Command(databaseClient, "--execute", sql).Run()
+		_, _ = run(databaseClient, "--execute", sql)
 	}
 
 	_ = os.Remove(metadataPath)
@@ -6373,8 +6835,8 @@ func createMailDomain(domain string) error {
 		return err
 	}
 
-	_ = exec.Command("postmap", vhostsPath).Run()
-	_ = exec.Command("systemctl", "reload", "postfix").Run()
+	_, _ = run("postmap", vhostsPath)
+	_, _ = run("systemctl", "reload", "postfix")
 
 	_ = writeAudit("mail.domain.created", true, domain)
 	return nil
@@ -6403,7 +6865,7 @@ func deleteMailDomain(domain string) error {
 			newLines = append(newLines, line)
 		}
 		_ = atomicWrite(vhostsPath, []byte(strings.Join(newLines, "\n")+"\n"), 0600)
-		_ = exec.Command("postmap", vhostsPath).Run()
+		_, _ = run("postmap", vhostsPath)
 	}
 
 	vmapsPath := "/etc/postfix/vmaps"
@@ -6426,7 +6888,7 @@ func deleteMailDomain(domain string) error {
 			newLines = append(newLines, line)
 		}
 		_ = atomicWrite(vmapsPath, []byte(strings.Join(newLines, "\n")+"\n"), 0600)
-		_ = exec.Command("postmap", vmapsPath).Run()
+		_, _ = run("postmap", vmapsPath)
 	}
 
 	dovecotUsersPath := "/etc/dovecot/users"
@@ -6453,8 +6915,8 @@ func deleteMailDomain(domain string) error {
 
 	_ = os.RemoveAll(filepath.Join("/etc/opendkim/keys", domain))
 
-	_ = exec.Command("systemctl", "reload", "postfix").Run()
-	_ = exec.Command("systemctl", "reload", "dovecot").Run()
+	_, _ = run("systemctl", "reload", "postfix")
+	_, _ = run("systemctl", "reload", "dovecot")
 
 	_ = writeAudit("mail.domain.deleted", true, domain)
 	return nil
@@ -6499,7 +6961,8 @@ func createMailAccount(email, password string) error {
 		}
 	}
 
-	output, err := exec.Command("openssl", "passwd", "-6", password).CombinedOutput()
+	// -stdin keeps the password out of the process list.
+	output, err := runWithStdin(defaultTimeout, password+"\n", "openssl", "passwd", "-6", "-stdin")
 	if err != nil {
 		return fmt.Errorf("generate secure password hash: %s", tail(string(output), 500))
 	}
@@ -6528,9 +6991,9 @@ func createMailAccount(email, password string) error {
 		return err
 	}
 
-	_ = exec.Command("postmap", vmapsPath).Run()
-	_ = exec.Command("systemctl", "reload", "postfix").Run()
-	_ = exec.Command("systemctl", "reload", "dovecot").Run()
+	_, _ = run("postmap", vmapsPath)
+	_, _ = run("systemctl", "reload", "postfix")
+	_, _ = run("systemctl", "reload", "dovecot")
 
 	_ = writeAudit("mail.account.created", true, email)
 	return nil
@@ -6558,7 +7021,7 @@ func deleteMailAccount(email string) error {
 			newLines = append(newLines, line)
 		}
 		_ = atomicWrite(vmapsPath, []byte(strings.Join(newLines, "\n")+"\n"), 0600)
-		_ = exec.Command("postmap", vmapsPath).Run()
+		_, _ = run("postmap", vmapsPath)
 	}
 
 	dovecotUsersPath := "/etc/dovecot/users"
@@ -6579,8 +7042,8 @@ func deleteMailAccount(email string) error {
 		_ = atomicWrite(dovecotUsersPath, []byte(strings.Join(newLines, "\n")+"\n"), 0600)
 	}
 
-	_ = exec.Command("systemctl", "reload", "postfix").Run()
-	_ = exec.Command("systemctl", "reload", "dovecot").Run()
+	_, _ = run("systemctl", "reload", "postfix")
+	_, _ = run("systemctl", "reload", "dovecot")
 
 	_ = writeAudit("mail.account.deleted", true, email)
 	return nil
@@ -6641,8 +7104,8 @@ func createMailAlias(source, destination string) error {
 		return err
 	}
 
-	_ = exec.Command("postmap", virtualPath).Run()
-	_ = exec.Command("systemctl", "reload", "postfix").Run()
+	_, _ = run("postmap", virtualPath)
+	_, _ = run("systemctl", "reload", "postfix")
 
 	_ = writeAudit("mail.alias.created", true, source+" -> "+destination)
 	return nil
@@ -6670,10 +7133,48 @@ func deleteMailAlias(source string) error {
 			newLines = append(newLines, line)
 		}
 		_ = atomicWrite(virtualPath, []byte(strings.Join(newLines, "\n")+"\n"), 0600)
-		_ = exec.Command("postmap", virtualPath).Run()
+		_, _ = run("postmap", virtualPath)
 	}
 
-	_ = exec.Command("systemctl", "reload", "postfix").Run()
+	_, _ = run("systemctl", "reload", "postfix")
 	_ = writeAudit("mail.alias.deleted", true, source)
 	return nil
+}
+
+// siteDatabase resolves which database belongs to a site.
+//
+// The association has lived in two places for historical reasons: apps ServerDeck
+// installed record it in their app file, while a site created on its own had
+// nowhere to record one at all. The site record is now the primary home, with the
+// app record as a fallback so existing installs keep working.
+//
+// Getting this wrong is not cosmetic. Backups ask this question to decide whether
+// to include a database, so a site whose database cannot be resolved is backed up
+// as files only — which cannot restore it.
+func siteDatabase(domain string) (name string, user string, found bool) {
+	domain = normaliseHost(domain)
+
+	if value, err := readSiteMetadata(domain); err == nil && value.Database != "" {
+		return value.Database, value.DatabaseUser, true
+	}
+	// Any installed app, not only WordPress: Drupal, Joomla and the rest all
+	// have databases, and gating on WordPress silently dropped them.
+	if app, err := readInstalledApp(domain); err == nil && app.Database != "" {
+		return app.Database, app.DatabaseUser, true
+	}
+	return "", "", false
+}
+
+// writeSiteMetadata persists a site record.
+func writeSiteMetadata(value site) error {
+	// The password is deliberately dropped: it is shown once at creation and
+	// then lives only in the application's own configuration file.
+	stored := value
+	stored.DatabasePassword = ""
+	encoded, err := json.MarshalIndent(stored, "", "  ")
+	if err != nil {
+		return err
+	}
+	return atomicWrite(filepath.Join("/var/lib/serverdeck/sites", normaliseHost(value.Domain)+".json"),
+		append(encoded, '\n'), 0644)
 }
